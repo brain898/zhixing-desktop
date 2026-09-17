@@ -156,8 +156,26 @@ export const api = {
     return response.json();
   },
 
-  getFileUrl(documentId: string, versionId: string): string {
-    return `${API_BASE_URL}/documents/${documentId}/versions/${versionId}/file`;
+  async downloadOriginalFile(documentId: string, versionId: string): Promise<Blob> {
+    const headers: Record<string, string> = {};
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`;
+    }
+
+    const response = await fetch(`${API_BASE_URL}/documents/${documentId}/versions/${versionId}/file`, { headers });
+
+    if (response.status === 401) {
+      setAuthToken(null);
+      if (onUnauthorizedCallback) onUnauthorizedCallback();
+      throw new Error('\u767b\u5f55\u5df2\u5931\u6548\uff0c\u8bf7\u91cd\u65b0\u767b\u5f55');
+    }
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ detail: '\u539f\u6587\u4ef6\u4e0b\u8f7d\u5931\u8d25' }));
+      throw new Error(err.detail || `\u539f\u6587\u4ef6\u4e0b\u8f7d\u5931\u8d25 (${response.status})`);
+    }
+
+    return response.blob();
   },
 
   async getKnowledgeItems(params?: {

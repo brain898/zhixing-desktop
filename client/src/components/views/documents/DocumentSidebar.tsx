@@ -85,6 +85,13 @@ export const DocumentSidebar: React.FC<DocumentSidebarProps> = ({
             原子提炼中
           </span>
         );
+      case 'partial_failed':
+        return (
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: 'var(--error-text)', fontSize: '11px' }}>
+            <AlertCircle size={12} />
+            {'\u539f\u5b50\u63d0\u70bc\u5f02\u5e38'}
+          </span>
+        );
       case 'failed':
         return (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: 'var(--error-text)', fontSize: '11px' }}>

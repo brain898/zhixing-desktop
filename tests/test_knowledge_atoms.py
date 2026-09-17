@@ -10,6 +10,10 @@ sys.path.insert(0, str(SERVER_DIR))
 
 from database import init_db, get_db
 from seed import seed_data
+import config
+
+# Unit tests must be deterministic and must not depend on external DeepSeek latency/network.
+config.DEEPSEEK_API_KEY = ""
 from auth import create_session
 from deepseek_extractor import (
     rule_based_extract_atoms,

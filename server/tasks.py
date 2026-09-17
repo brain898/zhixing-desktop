@@ -445,7 +445,7 @@ def execute_extract_task(task_id: str):
                 (err_msg, failed_iso, task_id)
             )
             conn.execute(
-                "UPDATE document_versions SET processing_status = 'completed', error_summary = ? WHERE id = ?",
+                "UPDATE document_versions SET processing_status = 'partial_failed', error_summary = ? WHERE id = ?",
                 (f"抽取部分异常: {err_msg}", version_id)
             )
 

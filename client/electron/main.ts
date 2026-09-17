@@ -8,6 +8,7 @@ app.disableHardwareAcceleration();
 
 let mainWindow: BrowserWindow | null = null;
 let backendProcess: ChildProcess | null = null;
+let backendOwnedByThisProcess = false;
 
 function checkBackendAlive(): Promise<boolean> {
   return new Promise((resolve) => {
@@ -38,9 +39,14 @@ async function ensureBackendRunning() {
         stdio: 'ignore',
         windowsHide: true,
       });
+      backendOwnedByThisProcess = true;
 
       backendProcess.on('error', (err) => {
         console.error('Failed to spawn backend process:', err);
+      });
+      backendProcess.on('exit', () => {
+        backendProcess = null;
+        backendOwnedByThisProcess = false;
       });
 
       // 轮询等待后台服务就绪
@@ -115,16 +121,30 @@ ipcMain.handle('window-is-maximized', () => {
   return mainWindow ? mainWindow.isMaximized() : false;
 });
 
-app.whenReady().then(async () => {
-  await ensureBackendRunning();
-  createWindow();
+const gotTheLock = app.requestSingleInstanceLock();
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
     }
   });
-});
+
+  app.whenReady().then(async () => {
+    await ensureBackendRunning();
+    createWindow();
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+      }
+    });
+  });
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
@@ -133,6 +153,8 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  if (!backendOwnedByThisProcess) return;
+
   try {
     const req = http.request(
       {

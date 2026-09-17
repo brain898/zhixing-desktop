@@ -13,6 +13,10 @@ sys.path.insert(0, str(SERVER_DIR))
 from main import app
 from database import init_db
 from seed import seed_data
+import config
+
+# Unit tests must be deterministic and must not depend on external DeepSeek latency/network.
+config.DEEPSEEK_API_KEY = ""
 
 class TestDocumentManagement(unittest.TestCase):
     @classmethod

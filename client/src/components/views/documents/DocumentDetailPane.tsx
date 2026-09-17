@@ -34,6 +34,7 @@ export const DocumentDetailPane: React.FC<DocumentDetailPaneProps> = ({
   const [loading, setLoading] = useState(true);
   const [blocksLoading, setBlocksLoading] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const fetchDetail = async (preserveVersion = true) => {
@@ -89,7 +90,7 @@ export const DocumentDetailPane: React.FC<DocumentDetailPaneProps> = ({
     if (!documentId || !selectedVersionId) return;
 
     const currentVer = docDetail?.versions.find((v) => v.id === selectedVersionId);
-    if (!currentVer || currentVer.processing_status !== 'completed') {
+    if (!currentVer || !['completed', 'extracting', 'partial_failed'].includes(currentVer.processing_status)) {
       setBlocks([]);
       return;
     }
@@ -120,6 +121,29 @@ export const DocumentDetailPane: React.FC<DocumentDetailPaneProps> = ({
       alert(err.message || '重试提交失败');
     } finally {
       setRetrying(false);
+    }
+  };
+
+  const handleDownload = async () => {
+    if (!documentId || !selectedVersionId) return;
+    const version = docDetail?.versions.find((v) => v.id === selectedVersionId);
+    if (!version) return;
+
+    try {
+      setDownloading(true);
+      const blob = await api.downloadOriginalFile(documentId, selectedVersionId);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = version.file_name || '\u539f\u6587\u4ef6';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      alert(err.message || '\u539f\u6587\u4ef6\u4e0b\u8f7d\u5931\u8d25');
+    } finally {
+      setDownloading(false);
     }
   };
 
@@ -262,16 +286,16 @@ export const DocumentDetailPane: React.FC<DocumentDetailPaneProps> = ({
             <span>重新解析</span>
           </button>
 
-          <a
-            href={api.getFileUrl(docDetail.id, currentVersion?.id || '')}
-            target="_blank"
-            rel="noreferrer"
+          <button
+            type="button"
+            onClick={handleDownload}
+            disabled={downloading || !currentVersion}
             className="btn-secondary"
-            style={{ height: '32px', fontSize: '12px', gap: '4px', textDecoration: 'none' }}
+            style={{ height: '32px', fontSize: '12px', gap: '4px' }}
           >
             <Download size={13} />
-            <span>查看原件</span>
-          </a>
+            <span>{downloading ? '\u4e0b\u8f7d\u4e2d...' : '\u67e5\u770b\u539f\u4ef6'}</span>
+          </button>
 
           <button
             data-testid="delete-doc-btn"
@@ -334,7 +358,7 @@ export const DocumentDetailPane: React.FC<DocumentDetailPaneProps> = ({
                 border: '1px solid var(--border-color)',
               }}
             >
-              {(currentVersion?.processing_status === 'completed' || currentVersion?.processing_status === 'extracting') && (
+              {(['completed', 'extracting', 'partial_failed'].includes(currentVersion?.processing_status || '')) && (
                 <>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--success-text)', fontSize: '12px', fontWeight: 600 }}>
                     <CheckCircle2 size={14} />
@@ -407,6 +431,16 @@ export const DocumentDetailPane: React.FC<DocumentDetailPaneProps> = ({
                   </div>
                   <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px', lineHeight: 1.4 }}>
                     正在调用 DeepSeek 大模型提炼多维知识候选与事实证据，请稍候...
+                  </div>
+                </>
+              ) : currentVersion?.processing_status === 'partial_failed' ? (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--error-text)', fontSize: '12px', fontWeight: 600 }}>
+                    <AlertCircle size={14} />
+                    <span>3. 知识原子提炼异常</span>
+                  </div>
+                  <div style={{ fontSize: '11px', color: 'var(--error-text)', marginTop: '4px', lineHeight: 1.4 }}>
+                    正文结构已解析完成，但知识原子提炼失败。原因：{currentVersion.error_summary || '未知异常'}
                   </div>
                 </>
               ) : (
