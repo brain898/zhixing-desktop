@@ -1,0 +1,33 @@
+{
+  "name": "zhixing-desktop-client",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "dev:vite": "vite",
+    "build:vite": "tsc --noEmit && vite build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "dev": "concurrently -k \"vite\" \"cross-env WAIT_ON_TIMEOUT=60000 wait-on tcp:5173 && npm run start:electron\"",
+    "start:electron": "tsc -p tsconfig.electron.json && electron .",
+    "build": "npm run build:vite && npm run build:electron"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.16.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.4",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^9.0.1",
+    "cross-env": "^7.0.3",
+    "electron": "^32.1.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.3",
+    "wait-on": "^8.0.0"
+  }
+}

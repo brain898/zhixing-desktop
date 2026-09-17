@@ -1,0 +1,150 @@
+@import './variables.css';
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  font-family: var(--font-family-base);
+  font-size: var(--font-size-base);
+  color: var(--text-primary);
+  background-color: var(--bg-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 窗口拖拽区域（Electron无边框窗口） */
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+
+.titlebar-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  outline: none;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--brand-accent);
+  outline-offset: 1px;
+}
+
+input {
+  font-family: inherit;
+  font-size: inherit;
+  outline: none;
+}
+
+input:focus {
+  border-color: var(--brand-accent) !important;
+}
+
+/* 按钮通用样式 */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background-color: var(--brand-accent);
+  color: #FFFFFF;
+  font-weight: 500;
+  height: 36px;
+  padding: 0 16px;
+  border-radius: var(--radius-md);
+  transition: background-color 140ms ease;
+  white-space: nowrap;
+}
+
+.btn-primary:hover {
+  background-color: var(--brand-hover);
+}
+
+.btn-primary:active {
+  background-color: var(--brand-active);
+}
+
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background-color: transparent;
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  font-weight: 500;
+  height: 36px;
+  padding: 0 14px;
+  border-radius: var(--radius-md);
+  transition: all 140ms ease;
+  white-space: nowrap;
+}
+
+.btn-secondary:hover {
+  background-color: var(--bg-secondary);
+}
+
+/* 状态标签样式 */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+}
+
+.status-badge.pending {
+  background-color: var(--pending-bg);
+  color: var(--pending-text);
+}
+
+.status-badge.success {
+  background-color: var(--success-bg);
+  color: var(--success-text);
+}
+
+.status-badge.error {
+  background-color: var(--error-bg);
+  color: var(--error-text);
+}
+
+.status-badge.neutral {
+  background-color: var(--bg-neutral-tag);
+  color: var(--text-secondary);
+}
+
+/* 滚动条美化 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #D8DBD9;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #B4B9B6;
+}
