@@ -1,8 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   X,
   CheckCircle2,
   AlertTriangle,
+  AlertCircle,
+  Info,
   Clock,
   BookOpen,
   FileText,
@@ -10,14 +12,19 @@ import {
   Save,
   Tag,
   Shield,
-  Layers,
   Sparkles,
+  ChevronLeft,
+  ChevronRight,
+  Edit3,
+  Plus,
+  Ban,
+  Check,
+  RotateCcw,
 } from 'lucide-react';
 import {
   KnowledgeItemDetail,
   PrimaryCategory,
   AtomType,
-  FieldState,
   MetricDefinition,
   CaseDetails,
 } from '../../../types';
@@ -25,14 +32,16 @@ import { api } from '../../../services/api';
 import { UnsavedChangesModal } from './UnsavedChangesModal';
 import { formatVersionLabel, formatAnchor, formatFieldName } from '../../../utils/formatters';
 
-interface ProofreadingModalProps {
+export interface ProofreadingModalProps {
   itemId: string | null;
+  itemList?: string[];
+  onSelectNext?: (nextId: string) => void;
   onClose: () => void;
   onSaved: () => void;
   onDeleted: () => void;
 }
 
-const CATEGORY_COLORS: Record<string, { bg: string; text: string; border: string }> = {
+const CATEGORY_STYLES: Record<string, { bg: string; text: string; border: string }> = {
   制度与标准: { bg: '#EBF4F0', text: '#285C49', border: '#C2DBD0' },
   方法与工具: { bg: '#EBF8FF', text: '#2B6CB0', border: '#BEE3F8' },
   项目案例: { bg: '#FAF5FF', text: '#6B46C1', border: '#E9D8FD' },
@@ -40,8 +49,17 @@ const CATEGORY_COLORS: Record<string, { bg: string; text: string; border: string
   专家经验: { bg: '#F0FFF4', text: '#22543D', border: '#C6F6D5' },
 };
 
+const EXCLUSION_REASONS = [
+  '非实质业务知识，属于无关泛文本',
+  '排版分割线、纯符号或格式噪音',
+  '与已有收录的知识内容重复',
+  '其他原因',
+];
+
 export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
   itemId,
+  itemList = [],
+  onSelectNext,
   onClose,
   onSaved,
   onDeleted,
@@ -53,7 +71,11 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // 表单受控状态
+  // 全量编辑模式与就地微调
+  const [fullEditMode, setFullEditMode] = useState(false);
+  const [editingSection, setEditingSection] = useState<string | null>(null);
+
+  // 表单受控数据
   const [title, setTitle] = useState('');
   const [statement, setStatement] = useState('');
   const [content, setContent] = useState('');
@@ -73,19 +95,35 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
   const [validUntil, setValidUntil] = useState('');
   const [qualityFlags, setQualityFlags] = useState<string[]>([]);
 
-  // 脏状态追踪与未保存拦截
+  // 脏状态追踪
   const [isDirty, setIsDirty] = useState(false);
   const [showUnsavedPrompt, setShowUnsavedPrompt] = useState(false);
+  const [pendingNextId, setPendingNextId] = useState<string | null>(null);
 
-  // 标签快速添加
+  // 排除（不收录）弹窗状态
+  const [showExcludeModal, setShowExcludeModal] = useState(false);
+  const [selectedExcludeReason, setSelectedExcludeReason] = useState(EXCLUSION_REASONS[0]);
+  const [customExcludeReason, setCustomExcludeReason] = useState('');
+
+  // 标签输入
   const [tagInput, setTagInput] = useState('');
   const [tagType, setTagType] = useState<'customer' | 'scene' | 'problem'>('scene');
+
+  // 当前条目在列表中的索引
+  const currentIndex = useMemo(() => {
+    if (!itemId || !itemList || itemList.length === 0) return -1;
+    return itemList.indexOf(itemId);
+  }, [itemId, itemList]);
+
+  const hasPrev = currentIndex > 0;
+  const hasNext = currentIndex >= 0 && currentIndex < itemList.length - 1;
 
   useEffect(() => {
     if (!itemId) return;
     let isMounted = true;
     setLoading(true);
     setError(null);
+    setEditingSection(null);
 
     api
       .getKnowledgeItemDetail(itemId)
@@ -93,9 +131,9 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
         if (!isMounted) return;
         setDetail(data);
         const av = data.active_version;
-        setTitle(av.title);
-        setStatement(av.statement);
-        setContent(av.content || av.statement);
+        setTitle(av.title || '');
+        setStatement(av.statement || '');
+        setContent(av.content || av.statement || '');
         setPrimaryCategory(av.primary_category || '');
         setAtomType(av.atom_type || '规则');
         setSubject(av.subject || '物业责任主体');
@@ -107,7 +145,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
         setCustomerTypes(av.customer_types || []);
         setBusinessScenes(av.business_scenes || []);
         setProblemTags(av.problem_tags || []);
-        setAccessScope(data.access_scope);
+        setAccessScope(data.access_scope || 'admin_only');
         setValidFrom(av.valid_from || '');
         setValidUntil(av.valid_until || '');
         setQualityFlags(av.quality_flags || []);
@@ -130,13 +168,55 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
     if (!isDirty) setIsDirty(true);
   };
 
-  const handleRequestClose = () => {
-    if (isDirty) {
-      setShowUnsavedPrompt(true);
-    } else {
-      onClose();
+  // 质检信息三层分类（阻断启用、建议确认、原文未提及）
+  const qualityCheck = useMemo(() => {
+    const blocking: string[] = [];
+    const suggestions: string[] = [];
+    const neutralInfos: string[] = [];
+
+    if (!title.trim()) {
+      blocking.push('知识条目标题不能为空');
     }
-  };
+    if (!statement.trim() || statement.trim() === '---' || statement.trim().length < 4) {
+      blocking.push('核心陈述不能为空且须具备实质业务内容');
+    }
+    if (!primaryCategory) {
+      blocking.push('主分类仍为「待分类」，确认前必须明确指定五类主分类之一');
+    }
+
+    // 分析现有 quality_flags
+    for (const flag of qualityFlags) {
+      if (flag.includes('管理员操作')) continue;
+
+      if (
+        flag.includes('缺少') ||
+        flag.includes('无效') ||
+        flag.includes('纯符号') ||
+        flag.includes('横线') ||
+        flag.includes('无有效原文证据') ||
+        flag.includes('未指定五类主分类')
+      ) {
+        if (!blocking.includes(flag)) blocking.push(flag);
+      } else if (
+        flag.includes('未提供') ||
+        flag.includes('未提及') ||
+        flag.includes('未明确') ||
+        flag.includes('未包含') ||
+        flag.includes('允许留空')
+      ) {
+        if (!neutralInfos.includes(flag)) neutralInfos.push(flag);
+      } else {
+        if (!suggestions.includes(flag)) suggestions.push(flag);
+      }
+    }
+
+    return {
+      blocking,
+      suggestions,
+      neutralInfos,
+      isBlocked: blocking.length > 0,
+    };
+  }, [title, statement, primaryCategory, qualityFlags]);
 
   const buildPayload = () => {
     if (!detail) return {};
@@ -144,7 +224,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
       revision_token: detail.active_version.revision_token,
       title,
       statement,
-      content,
+      content: content || statement,
       primary_category: primaryCategory || null,
       atom_type: atomType,
       subject,
@@ -169,7 +249,6 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
       setSaving(true);
       const payload = buildPayload();
       const res = await api.saveKnowledgeDraft(detail.id, payload);
-      // 更新本地 token 与质检标记
       setDetail((prev) => {
         if (!prev) return null;
         return {
@@ -185,6 +264,12 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
       setIsDirty(false);
       setShowUnsavedPrompt(false);
       onSaved();
+
+      if (pendingNextId && onSelectNext) {
+        const next = pendingNextId;
+        setPendingNextId(null);
+        onSelectNext(next);
+      }
     } catch (err: any) {
       alert(`保存草稿失败: ${err.message}`);
     } finally {
@@ -192,33 +277,26 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
     }
   };
 
-  // 确认知识版本（严格门槛）
+  // 确认知识并启用
   const handleConfirm = async () => {
     if (!detail) return;
-    // 客户端先做基本检查
-    if (!title.trim() || !statement.trim()) {
-      alert('确认失败：知识标题与核心陈述为必填项');
-      return;
-    }
-    if (!primaryCategory) {
-      alert('确认失败：主分类仍为「待分类」，确认前必须明确指定五类主分类之一');
+
+    if (qualityCheck.isBlocked) {
+      alert(`无法确认启用：\n${qualityCheck.blocking.join('\n')}`);
       return;
     }
 
     try {
       setConfirming(true);
-      // 先保存当前草稿修改
       if (isDirty) {
         const draftRes = await api.saveKnowledgeDraft(detail.id, buildPayload());
         detail.active_version.revision_token = draftRes.revision_token;
       }
 
-      // 执行确认
       const confirmRes = await api.confirmKnowledgeItem(detail.id, {
         revision_token: detail.active_version.revision_token,
       });
 
-      // 更新本地状态为已确认
       setDetail((prev) => {
         if (!prev) return null;
         return {
@@ -233,6 +311,11 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
       });
       setIsDirty(false);
       onSaved();
+
+      // 如果有下一条，自动跳入下一条连续核对
+      if (hasNext && onSelectNext) {
+        onSelectNext(itemList[currentIndex + 1]);
+      }
     } catch (err: any) {
       alert(`确认失败: ${err.message}`);
     } finally {
@@ -240,21 +323,93 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
     }
   };
 
-  // 逻辑删除
+  // 排除（不收录）操作
+  const handleConfirmExclude = async () => {
+    if (!detail) return;
+    const reason =
+      selectedExcludeReason === '其他原因'
+        ? customExcludeReason.trim() || '其他原因'
+        : selectedExcludeReason;
+
+    try {
+      setDeleting(true);
+      await api.deleteKnowledgeItem(detail.id, 'exclude', reason);
+      setShowExcludeModal(false);
+      onDeleted();
+
+      if (hasNext && onSelectNext) {
+        onSelectNext(itemList[currentIndex + 1]);
+      } else if (hasPrev && onSelectNext) {
+        onSelectNext(itemList[currentIndex - 1]);
+      } else {
+        onClose();
+      }
+    } catch (err: any) {
+      alert(`排除操作失败: ${err.message}`);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  // 逻辑彻底删除
   const handleDelete = async () => {
     if (!detail) return;
-    if (!window.confirm(`确认删除知识条目「${detail.active_version.title}」？删除后将撤销检索与日常访问资格。`)) {
+    if (
+      !window.confirm(
+        `确认彻底删除知识条目「${detail.active_version.title}」？删除后将撤销检索与日常访问资格。`
+      )
+    ) {
       return;
     }
     try {
       setDeleting(true);
-      await api.deleteKnowledgeItem(detail.id);
+      await api.deleteKnowledgeItem(detail.id, 'delete');
       onDeleted();
-      onClose();
+      if (hasNext && onSelectNext) {
+        onSelectNext(itemList[currentIndex + 1]);
+      } else {
+        onClose();
+      }
     } catch (err: any) {
       alert(`删除失败: ${err.message}`);
     } finally {
       setDeleting(false);
+    }
+  };
+
+  // 切换条目处理
+  const navigateTo = (nextId: string) => {
+    if (!onSelectNext) return;
+    if (isDirty) {
+      setPendingNextId(nextId);
+      setShowUnsavedPrompt(true);
+    } else {
+      onSelectNext(nextId);
+    }
+  };
+
+  const handleRequestClose = () => {
+    if (isDirty) {
+      setPendingNextId(null);
+      setShowUnsavedPrompt(true);
+    } else {
+      onClose();
+    }
+  };
+
+  // 暂不处理（跳过此条）
+  const handleSkip = () => {
+    if (hasNext && onSelectNext) {
+      if (isDirty) {
+        if (window.confirm('当前条目已修改，确定不保存直接跳过吗？')) {
+          setIsDirty(false);
+          onSelectNext(itemList[currentIndex + 1]);
+        }
+      } else {
+        onSelectNext(itemList[currentIndex + 1]);
+      }
+    } else {
+      onClose();
     }
   };
 
@@ -283,32 +438,32 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
         style={{
           position: 'fixed',
           inset: 0,
-          backgroundColor: 'rgba(0, 0, 0, 0.5)',
+          backgroundColor: 'rgba(0, 0, 0, 0.55)',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
           zIndex: 1000,
-          padding: '20px',
+          padding: '16px',
         }}
       >
         <div
           style={{
-            width: '1280px',
+            width: '1360px',
             maxWidth: '96vw',
-            height: '860px',
+            height: '890px',
             maxHeight: '94vh',
             backgroundColor: '#FFFFFF',
             borderRadius: 'var(--radius-lg)',
-            boxShadow: '0 12px 40px rgba(0, 0, 0, 0.2)',
+            boxShadow: '0 16px 48px rgba(0, 0, 0, 0.22)',
             display: 'flex',
             flexDirection: 'column',
             overflow: 'hidden',
           }}
         >
-          {/* 顶栏：标题与状态播报 */}
+          {/* 顶栏：标题、说明与状态表达 */}
           <div
             style={{
-              padding: '16px 24px',
+              padding: '14px 24px',
               borderBottom: '1px solid var(--border-color)',
               display: 'flex',
               alignItems: 'center',
@@ -319,8 +474,8 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
               <div
                 style={{
-                  width: '32px',
-                  height: '32px',
+                  width: '34px',
+                  height: '34px',
                   borderRadius: 'var(--radius-sm)',
                   backgroundColor: 'var(--brand-accent-light)',
                   color: 'var(--brand-accent)',
@@ -332,17 +487,26 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                 <BookOpen size={18} />
               </div>
               <div>
-                <div style={{ fontSize: '15px', fontWeight: 600, color: 'var(--text-primary)' }}>
-                  知识原子校对工作台
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ fontSize: '16px', fontWeight: 700, color: 'var(--text-primary)' }}>
+                    核对知识
+                  </span>
+                  <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                    核对系统整理的内容是否忠于原文，重点检查条件、动作和例外
+                  </span>
                 </div>
                 <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '2px' }}>
-                  来源资料：{detail?.document_title}（{formatVersionLabel(detail?.document_version_label)}）
+                  来源资料：
+                  <strong style={{ color: 'var(--text-primary)' }}>
+                    {detail?.document_title || '未知资料'}
+                  </strong>
+                  （{formatVersionLabel(detail?.document_version_label)}）
                 </div>
               </div>
             </div>
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-              {/* 审核状态徽标 */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              {/* 审核状态 */}
               {detail?.active_version.review_status === 'confirmed' ? (
                 <span
                   data-testid="confirmed-status-badge"
@@ -360,7 +524,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                   }}
                 >
                   <CheckCircle2 size={13} />
-                  <span>已确认，索引未建立</span>
+                  <span>已确认启用</span>
                 </span>
               ) : (
                 <span
@@ -379,23 +543,9 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                   }}
                 >
                   <Clock size={13} />
-                  <span>待校对</span>
+                  <span>待核对</span>
                 </span>
               )}
-
-              {/* 索引状态真实表达 */}
-              <span
-                style={{
-                  fontSize: '11px',
-                  padding: '3px 8px',
-                  borderRadius: 'var(--radius-sm)',
-                  backgroundColor: 'var(--bg-primary)',
-                  color: 'var(--text-muted)',
-                  border: '1px solid var(--border-color)',
-                }}
-              >
-                检索索引：未建立（待构建）
-              </span>
 
               {/* 提炼引擎标识 */}
               <span
@@ -403,20 +553,42 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                   fontSize: '11px',
                   padding: '3px 8px',
                   borderRadius: 'var(--radius-sm)',
-                  backgroundColor: 'var(--brand-accent-light)',
-                  color: 'var(--brand-accent)',
+                  backgroundColor: 'var(--bg-primary)',
+                  color: 'var(--text-secondary)',
+                  border: '1px solid var(--border-color)',
                   display: 'flex',
                   alignItems: 'center',
                   gap: '4px',
                 }}
               >
-                <Sparkles size={12} />
+                <Sparkles size={11} color="var(--brand-accent)" />
                 <span>
                   {detail?.active_version.extraction_context?.provider === 'deepseek-api'
-                    ? 'DeepSeek 官方大模型'
-                    : '结构化离线提炼引擎'}
+                    ? 'DeepSeek 大模型整理'
+                    : '离线规则整理'}
                 </span>
               </span>
+
+              {/* 模式切换 */}
+              <button
+                type="button"
+                onClick={() => setFullEditMode(!fullEditMode)}
+                style={{
+                  fontSize: '12px',
+                  padding: '4px 10px',
+                  borderRadius: 'var(--radius-sm)',
+                  backgroundColor: fullEditMode ? 'var(--brand-accent)' : '#FFFFFF',
+                  color: fullEditMode ? '#FFFFFF' : 'var(--text-primary)',
+                  border: '1px solid var(--border-color)',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                }}
+              >
+                <Edit3 size={12} />
+                <span>{fullEditMode ? '切换阅读模式' : '编辑全部内容'}</span>
+              </button>
 
               <button
                 type="button"
@@ -438,7 +610,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
             </div>
           </div>
 
-          {/* 主体左右两栏对照区 */}
+          {/* 主体两栏对照区 */}
           {loading ? (
             <div
               style={{
@@ -450,7 +622,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                 fontSize: '13px',
               }}
             >
-              正在加载知识原子与原文证据...
+              正在加载知识内容与原文比对数据...
             </div>
           ) : error ? (
             <div
@@ -467,7 +639,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
             </div>
           ) : (
             <div style={{ flex: 1, display: 'flex', minHeight: 0, overflow: 'hidden' }}>
-              {/* 左侧：原文证据对照栏 (42% 宽度) */}
+              {/* 左栏：42% 原文证据对照栏 */}
               <div
                 style={{
                   width: '42%',
@@ -492,10 +664,10 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                 >
                   <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                     <FileText size={15} color="var(--brand-accent)" />
-                    <span>原文证据对照 ({detail?.evidence.length || 0} 处支撑)</span>
+                    <span>原文证据对照（共 {detail?.evidence.length || 0} 处支撑）</span>
                   </div>
                   <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                    不虚构页码，精确到段落/表格
+                    不虚构页码，精确到段落与表格
                   </span>
                 </div>
 
@@ -537,7 +709,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                               fontWeight: 600,
                               color: 'var(--brand-accent)',
                               backgroundColor: 'var(--brand-accent-light)',
-                              padding: '2px 6px',
+                              padding: '2px 8px',
                               borderRadius: 'var(--radius-sm)',
                             }}
                           >
@@ -558,7 +730,8 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
 
                         {ev.heading_path && (
                           <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                            章节路径：<strong>{ev.heading_path}</strong>
+                            章节路径：
+                            <strong style={{ color: 'var(--text-primary)' }}>{ev.heading_path}</strong>
                           </div>
                         )}
 
@@ -579,7 +752,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                           </div>
                         )}
 
-                        {/* 完整结构块正文 */}
+                        {/* 完整原文段落 */}
                         <div
                           style={{
                             fontSize: '12px',
@@ -598,13 +771,16 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                   ) : (
                     <div
                       style={{
-                        padding: '30px',
+                        padding: '36px 20px',
                         textAlign: 'center',
                         color: 'var(--text-muted)',
                         fontSize: '13px',
+                        backgroundColor: '#FFFFFF',
+                        borderRadius: 'var(--radius-md)',
+                        border: '1px dashed var(--border-color)',
                       }}
                     >
-                      该条目暂无绑定的原文证据（请检查抽取日志）
+                      该条目暂无关联的原文段落（可能是手动添加或直接导入）
                     </div>
                   )}
 
@@ -617,14 +793,20 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                       borderRadius: 'var(--radius-sm)',
                       lineHeight: 1.5,
                       border: '1px dashed var(--border-color)',
+                      display: 'flex',
+                      alignItems: 'flex-start',
+                      gap: '6px',
                     }}
                   >
-                    💡 提示：来源文本匹配仅证明在原文中检索到相应段落或表格，不能代替管理员进行语义校对。
+                    <Info size={14} style={{ flexShrink: 0, marginTop: '2px' }} />
+                    <span>
+                      注：来源文本匹配仅证明在原文中检索到相应段落或表格，仍需人工核对语义是否完整准确。
+                    </span>
                   </div>
                 </div>
               </div>
 
-              {/* 右侧：知识原子详情与编辑表单 (58% 宽度) */}
+              {/* 右栏：58% 可读知识展示与就地修改 */}
               <div
                 style={{
                   width: '58%',
@@ -641,11 +823,54 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                     padding: '20px 24px',
                     display: 'flex',
                     flexDirection: 'column',
-                    gap: '20px',
+                    gap: '18px',
                   }}
                 >
-                  {/* 质检问题告警条 */}
-                  {qualityFlags.length > 0 && (
+                  {/* 1. 质检提示卡片（清晰区分三级） */}
+                  {/* 1.1 阻断启用问题 */}
+                  {qualityCheck.blocking.length > 0 && (
+                    <div
+                      style={{
+                        backgroundColor: '#FEF2F2',
+                        border: '1px solid #FCA5A5',
+                        borderRadius: 'var(--radius-md)',
+                        padding: '12px 16px',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontSize: '12px',
+                          fontWeight: 700,
+                          color: '#DC2626',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                        }}
+                      >
+                        <AlertCircle size={15} />
+                        <span>阻断启用问题（需修复后方可确认启用）：</span>
+                      </div>
+                      <ul
+                        style={{
+                          margin: 0,
+                          paddingLeft: '20px',
+                          fontSize: '12px',
+                          color: '#B91C1C',
+                          lineHeight: 1.6,
+                        }}
+                      >
+                        {qualityCheck.blocking.map((msg, idx) => (
+                          <li key={idx}>{msg}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {/* 1.2 待核对建议 */}
+                  {qualityCheck.suggestions.length > 0 && (
                     <div
                       style={{
                         backgroundColor: 'var(--warning-bg)',
@@ -668,7 +893,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                         }}
                       >
                         <AlertTriangle size={15} />
-                        <span>检测到待核验质量问题（需管理员校对确认）：</span>
+                        <span>待核对建议（请比对左侧原文）：</span>
                       </div>
                       <ul
                         style={{
@@ -679,251 +904,1015 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                           lineHeight: 1.6,
                         }}
                       >
-                        {qualityFlags.map((flag, idx) => (
-                          <li key={idx}>{flag}</li>
+                        {qualityCheck.suggestions.map((msg, idx) => (
+                          <li key={idx}>{msg}</li>
                         ))}
                       </ul>
                     </div>
                   )}
 
-                  {/* 基础信息区：标题与五类分类 */}
-                  <div
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: '2fr 1fr',
-                      gap: '16px',
-                    }}
-                  >
-                    <div>
-                      <label
-                        style={{
-                          fontSize: '12px',
-                          fontWeight: 600,
-                          color: 'var(--text-secondary)',
-                          marginBottom: '6px',
-                          display: 'block',
-                        }}
-                      >
-                        知识条目标题 *
-                      </label>
-                      <input
-                        type="text"
-                        data-testid="input-title"
-                        value={title}
-                        onChange={(e) => {
-                          setTitle(e.target.value);
-                          markDirty();
-                        }}
-                        style={{
-                          width: '100%',
-                          height: '36px',
-                          padding: '0 12px',
-                          fontSize: '13px',
-                          borderRadius: 'var(--radius-sm)',
-                          border: '1px solid var(--border-color)',
-                          outline: 'none',
-                        }}
-                      />
-                    </div>
-
-                    <div>
-                      <label
-                        style={{
-                          fontSize: '12px',
-                          fontWeight: 600,
-                          color: 'var(--text-secondary)',
-                          marginBottom: '6px',
-                          display: 'block',
-                        }}
-                      >
-                        五类主分类 *
-                      </label>
-                      <select
-                        data-testid="select-primary-category"
-                        value={primaryCategory}
-                        onChange={(e) => {
-                          setPrimaryCategory(e.target.value as PrimaryCategory);
-                          markDirty();
-                        }}
-                        style={{
-                          width: '100%',
-                          height: '36px',
-                          padding: '0 10px',
-                          fontSize: '13px',
-                          fontWeight: 500,
-                          borderRadius: 'var(--radius-sm)',
-                          border: '1px solid var(--border-color)',
-                          backgroundColor: primaryCategory ? '#FFFFFF' : 'var(--warning-bg)',
-                          color: primaryCategory ? 'var(--text-primary)' : 'var(--warning-text)',
-                          outline: 'none',
-                          cursor: 'pointer',
-                        }}
-                      >
-                        <option value="">-- 待分类 (需确认) --</option>
-                        <option value="制度与标准">制度与标准</option>
-                        <option value="方法与工具">方法与工具</option>
-                        <option value="项目案例">项目案例</option>
-                        <option value="指标数据">指标数据</option>
-                        <option value="专家经验">专家经验</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  {/* 核心陈述与正文 */}
-                  <div>
-                    <label
+                  {/* 1.3 原文未提及说明 */}
+                  {qualityCheck.neutralInfos.length > 0 && (
+                    <div
                       style={{
+                        backgroundColor: 'var(--bg-secondary)',
+                        border: '1px solid var(--border-color)',
+                        borderRadius: 'var(--radius-md)',
+                        padding: '10px 14px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '8px',
                         fontSize: '12px',
-                        fontWeight: 600,
                         color: 'var(--text-secondary)',
-                        marginBottom: '6px',
-                        display: 'block',
                       }}
                     >
-                      独立可理解核心陈述 *
-                    </label>
-                    <textarea
-                      rows={3}
-                      value={statement}
-                      onChange={(e) => {
-                        setStatement(e.target.value);
-                        markDirty();
-                      }}
-                      placeholder="能独立核对的完整规则或事实，不脱离前提与例外..."
-                      style={{
-                        width: '100%',
-                        padding: '10px 12px',
-                        fontSize: '13px',
-                        lineHeight: 1.5,
-                        borderRadius: 'var(--radius-sm)',
-                        border: '1px solid var(--border-color)',
-                        outline: 'none',
-                        resize: 'vertical',
-                      }}
-                    />
-                  </div>
+                      <Info size={14} color="var(--text-muted)" />
+                      <span>
+                        原文未特别说明：{qualityCheck.neutralInfos.join('、')}（允许留空，不影响启用）
+                      </span>
+                    </div>
+                  )}
 
-                  {/* 原子三要素：主体、条件、动作、例外 */}
+                  {/* 2. 标题与所属分类 */}
                   <div
                     style={{
-                      backgroundColor: 'var(--bg-secondary)',
+                      border: '1px solid var(--border-color)',
                       borderRadius: 'var(--radius-md)',
-                      padding: '16px',
+                      padding: '16px 20px',
+                      backgroundColor: '#FFFFFF',
+                      boxShadow: '0 1px 3px rgba(0,0,0,0.02)',
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'flex-start',
+                        justifyContent: 'space-between',
+                        gap: '16px',
+                        marginBottom: '10px',
+                      }}
+                    >
+                      <div style={{ flex: 1 }}>
+                        <span style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block' }}>
+                          知识条目标题
+                        </span>
+                        {fullEditMode || editingSection === 'title' ? (
+                          <input
+                            type="text"
+                            data-testid="input-title"
+                            value={title}
+                            onChange={(e) => {
+                              setTitle(e.target.value);
+                              markDirty();
+                            }}
+                            placeholder="输入简明扼要的知识标题..."
+                            style={{
+                              width: '100%',
+                              height: '36px',
+                              padding: '0 10px',
+                              fontSize: '14px',
+                              fontWeight: 600,
+                              borderRadius: 'var(--radius-sm)',
+                              border: '1px solid var(--brand-accent)',
+                              outline: 'none',
+                              marginTop: '4px',
+                            }}
+                          />
+                        ) : (
+                          <div
+                            style={{
+                              fontSize: '17px',
+                              fontWeight: 700,
+                              color: 'var(--text-primary)',
+                              marginTop: '2px',
+                              lineHeight: 1.4,
+                            }}
+                          >
+                            {title || '（未命名知识条目）'}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* 编辑按钮 */}
+                      {!fullEditMode && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setEditingSection(editingSection === 'title' ? null : 'title')
+                          }
+                          style={{
+                            fontSize: '11px',
+                            color: 'var(--text-secondary)',
+                            background: 'none',
+                            border: 'none',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '3px',
+                            padding: '4px 6px',
+                            borderRadius: 'var(--radius-sm)',
+                          }}
+                        >
+                          <Edit3 size={12} />
+                          <span>{editingSection === 'title' ? '完成' : '修改'}</span>
+                        </button>
+                      )}
+                    </div>
+
+                    {/* 主分类切换 */}
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        paddingTop: '10px',
+                        borderTop: '1px solid var(--bg-secondary)',
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                          所属五类主分类：
+                        </span>
+                        {fullEditMode || editingSection === 'category' ? (
+                          <select
+                            data-testid="select-primary-category"
+                            value={primaryCategory}
+                            onChange={(e) => {
+                              setPrimaryCategory(e.target.value as PrimaryCategory);
+                              markDirty();
+                            }}
+                            style={{
+                              height: '30px',
+                              padding: '0 8px',
+                              fontSize: '12px',
+                              fontWeight: 600,
+                              borderRadius: 'var(--radius-sm)',
+                              border: '1px solid var(--border-color)',
+                              backgroundColor: primaryCategory ? '#FFFFFF' : 'var(--warning-bg)',
+                              color: primaryCategory
+                                ? 'var(--text-primary)'
+                                : 'var(--warning-text)',
+                              outline: 'none',
+                            }}
+                          >
+                            <option value="">-- 待分类（必须指定五类之一） --</option>
+                            <option value="制度与标准">制度与标准</option>
+                            <option value="方法与工具">方法与工具</option>
+                            <option value="项目案例">项目案例</option>
+                            <option value="指标数据">指标数据</option>
+                            <option value="专家经验">专家经验</option>
+                          </select>
+                        ) : primaryCategory ? (
+                          <span
+                            style={{
+                              fontSize: '12px',
+                              fontWeight: 600,
+                              padding: '3px 10px',
+                              borderRadius: 'var(--radius-sm)',
+                              backgroundColor:
+                                CATEGORY_STYLES[primaryCategory]?.bg || 'var(--bg-secondary)',
+                              color:
+                                CATEGORY_STYLES[primaryCategory]?.text || 'var(--text-primary)',
+                              border: `1px solid ${
+                                CATEGORY_STYLES[primaryCategory]?.border || 'var(--border-color)'
+                              }`,
+                            }}
+                          >
+                            {primaryCategory}
+                          </span>
+                        ) : (
+                          <span
+                            style={{
+                              fontSize: '12px',
+                              fontWeight: 600,
+                              padding: '3px 10px',
+                              borderRadius: 'var(--radius-sm)',
+                              backgroundColor: 'var(--warning-bg)',
+                              color: 'var(--warning-text)',
+                              border: '1px solid #FCD34D',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                            }}
+                          >
+                            <AlertCircle size={12} />
+                            <span>待分类（需在确认前选定）</span>
+                          </span>
+                        )}
+                      </div>
+
+                      {!fullEditMode && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setEditingSection(editingSection === 'category' ? null : 'category')
+                          }
+                          style={{
+                            fontSize: '11px',
+                            color: 'var(--text-secondary)',
+                            background: 'none',
+                            border: 'none',
+                            cursor: 'pointer',
+                            padding: '4px 6px',
+                          }}
+                        >
+                          {editingSection === 'category' ? '完成' : '变更分类'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* 3. 核心陈述（排版舒适，非普通整屏表单输入框） */}
+                  <div
+                    style={{
+                      border: '1px solid var(--border-color)',
+                      borderRadius: 'var(--radius-md)',
+                      padding: '16px 20px',
+                      backgroundColor: '#FFFFFF',
+                      boxShadow: '0 1px 3px rgba(0,0,0,0.02)',
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        marginBottom: '8px',
+                      }}
+                    >
+                      <span
+                        style={{
+                          fontSize: '12px',
+                          fontWeight: 600,
+                          color: 'var(--text-secondary)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                        }}
+                      >
+                        <Shield size={14} color="var(--brand-accent)" />
+                        <span>独立可理解的核心陈述 *</span>
+                      </span>
+
+                      {!fullEditMode && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setEditingSection(editingSection === 'statement' ? null : 'statement')
+                          }
+                          style={{
+                            fontSize: '11px',
+                            color: 'var(--text-secondary)',
+                            background: 'none',
+                            border: 'none',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '3px',
+                          }}
+                        >
+                          <Edit3 size={12} />
+                          <span>{editingSection === 'statement' ? '完成' : '修改'}</span>
+                        </button>
+                      )}
+                    </div>
+
+                    {fullEditMode || editingSection === 'statement' ? (
+                      <textarea
+                        rows={3}
+                        value={statement}
+                        onChange={(e) => {
+                          setStatement(e.target.value);
+                          markDirty();
+                        }}
+                        placeholder="清晰陈述该知识的核心论断、规则或事实..."
+                        style={{
+                          width: '100%',
+                          padding: '10px 12px',
+                          fontSize: '13px',
+                          lineHeight: 1.6,
+                          borderRadius: 'var(--radius-sm)',
+                          border: '1px solid var(--brand-accent)',
+                          outline: 'none',
+                          resize: 'vertical',
+                        }}
+                      />
+                    ) : (
+                      <div
+                        style={{
+                          fontSize: '13px',
+                          lineHeight: 1.7,
+                          color: 'var(--text-primary)',
+                          backgroundColor: 'var(--bg-secondary)',
+                          padding: '12px 16px',
+                          borderRadius: 'var(--radius-sm)',
+                          borderLeft: '3px solid var(--brand-accent)',
+                          whiteSpace: 'pre-wrap',
+                        }}
+                      >
+                        {statement || '（暂无核心陈述）'}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* 4. 五类差异化结构要素卡片 */}
+                  <div
+                    style={{
+                      border: '1px solid var(--border-color)',
+                      borderRadius: 'var(--radius-md)',
+                      backgroundColor: 'var(--bg-secondary)',
+                      padding: '16px 20px',
                       display: 'flex',
                       flexDirection: 'column',
                       gap: '14px',
-                      border: '1px solid var(--border-color)',
                     }}
                   >
-                    <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-primary)' }}>
-                      知识原子结构字段
-                    </div>
-
-                    {/* 主体 */}
-                    <div>
-                      <label style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '4px', display: 'block' }}>
-                        业务执行主体
-                      </label>
-                      <input
-                        type="text"
-                        value={subject}
-                        onChange={(e) => {
-                          setSubject(e.target.value);
-                          markDirty();
-                        }}
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                      }}
+                    >
+                      <span
                         style={{
-                          width: '100%',
-                          height: '32px',
-                          padding: '0 10px',
-                          fontSize: '12px',
-                          borderRadius: 'var(--radius-sm)',
-                          border: '1px solid var(--border-color)',
-                          backgroundColor: '#FFFFFF',
-                          outline: 'none',
+                          fontSize: '13px',
+                          fontWeight: 700,
+                          color: 'var(--text-primary)',
                         }}
-                      />
+                      >
+                        {primaryCategory
+                          ? `${primaryCategory}结构要素`
+                          : '核心业务结构要素（待分类）'}
+                      </span>
+                      <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                        按业务类别适配结构化展示，可直接点击修改
+                      </span>
                     </div>
 
-                    {/* 条件 */}
-                    <div>
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
-                        <label style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                          触发条件与前提
-                        </label>
-                        <button
-                          type="button"
-                          className="btn-secondary"
-                          onClick={() => {
-                            setConditions([...conditions, '']);
-                            markDirty();
+                    {/* 制度与标准 */}
+                    {primaryCategory === '制度与标准' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                        {/* 适用对象 */}
+                        <div
+                          style={{
+                            backgroundColor: '#FFFFFF',
+                            padding: '12px 14px',
+                            borderRadius: 'var(--radius-sm)',
+                            border: '1px solid var(--border-color)',
                           }}
-                          style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
                         >
-                          + 添加条件
-                        </button>
-                      </div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                        {conditions.map((cond, idx) => (
-                          <div key={idx} style={{ display: 'flex', gap: '6px' }}>
+                          <div
+                            style={{
+                              fontSize: '11px',
+                              fontWeight: 600,
+                              color: 'var(--text-secondary)',
+                              marginBottom: '6px',
+                            }}
+                          >
+                            适用责任主体
+                          </div>
+                          {fullEditMode || editingSection === 'subject' ? (
                             <input
                               type="text"
-                              value={cond}
+                              value={subject}
                               onChange={(e) => {
-                                const copy = [...conditions];
-                                copy[idx] = e.target.value;
-                                setConditions(copy);
+                                setSubject(e.target.value);
                                 markDirty();
                               }}
+                              placeholder="如：物业服务企业、业主大会、街道办事处..."
                               style={{
-                                flex: 1,
+                                width: '100%',
                                 height: '30px',
-                                padding: '0 10px',
+                                padding: '0 8px',
                                 fontSize: '12px',
                                 borderRadius: 'var(--radius-sm)',
                                 border: '1px solid var(--border-color)',
-                                backgroundColor: '#FFFFFF',
-                                outline: 'none',
                               }}
                             />
+                          ) : (
+                            <div style={{ fontSize: '12px', color: 'var(--text-primary)' }}>
+                              {subject || '（未指定，默认为相关物业管理主体）'}
+                            </div>
+                          )}
+                        </div>
+
+                        {/* 条件与动作与例外 */}
+                        <div
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+                            gap: '12px',
+                          }}
+                        >
+                          {/* 触发条件与适用范围 */}
+                          <div
+                            style={{
+                              backgroundColor: '#FFFFFF',
+                              padding: '12px 14px',
+                              borderRadius: 'var(--radius-sm)',
+                              border: '1px solid var(--border-color)',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '6px',
+                            }}
+                          >
+                            <div
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                              }}
+                            >
+                              <span
+                                style={{
+                                  fontSize: '11px',
+                                  fontWeight: 600,
+                                  color: 'var(--text-secondary)',
+                                }}
+                              >
+                                适用条件与范围 ({conditions.length})
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setConditions([...conditions, '']);
+                                  markDirty();
+                                }}
+                                style={{
+                                  background: 'none',
+                                  border: 'none',
+                                  fontSize: '11px',
+                                  color: 'var(--brand-accent)',
+                                  cursor: 'pointer',
+                                }}
+                              >
+                                + 添加
+                              </button>
+                            </div>
+                            {conditions.length > 0 ? (
+                              conditions.map((cond, idx) => (
+                                <div key={idx} style={{ display: 'flex', gap: '6px' }}>
+                                  <input
+                                    type="text"
+                                    value={cond}
+                                    onChange={(e) => {
+                                      const copy = [...conditions];
+                                      copy[idx] = e.target.value;
+                                      setConditions(copy);
+                                      markDirty();
+                                    }}
+                                    style={{
+                                      flex: 1,
+                                      height: '28px',
+                                      padding: '0 8px',
+                                      fontSize: '12px',
+                                      borderRadius: 'var(--radius-sm)',
+                                      border: '1px solid var(--border-color)',
+                                    }}
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setConditions(conditions.filter((_, i) => i !== idx));
+                                      markDirty();
+                                    }}
+                                    style={{
+                                      background: 'none',
+                                      border: 'none',
+                                      color: 'var(--error-text)',
+                                      cursor: 'pointer',
+                                    }}
+                                  >
+                                    <X size={13} />
+                                  </button>
+                                </div>
+                              ))
+                            ) : (
+                              <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                                原文未设特殊前置条件
+                              </div>
+                            )}
+                          </div>
+
+                          {/* 执行要求与规范动作 */}
+                          <div
+                            style={{
+                              backgroundColor: '#FFFFFF',
+                              padding: '12px 14px',
+                              borderRadius: 'var(--radius-sm)',
+                              border: '1px solid var(--border-color)',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '6px',
+                            }}
+                          >
+                            <div
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                              }}
+                            >
+                              <span
+                                style={{
+                                  fontSize: '11px',
+                                  fontWeight: 600,
+                                  color: 'var(--text-secondary)',
+                                }}
+                              >
+                                规范动作与要求 ({actions.length})
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActions([...actions, '']);
+                                  markDirty();
+                                }}
+                                style={{
+                                  background: 'none',
+                                  border: 'none',
+                                  fontSize: '11px',
+                                  color: 'var(--brand-accent)',
+                                  cursor: 'pointer',
+                                }}
+                              >
+                                + 添加
+                              </button>
+                            </div>
+                            {actions.length > 0 ? (
+                              actions.map((act, idx) => (
+                                <div key={idx} style={{ display: 'flex', gap: '6px' }}>
+                                  <input
+                                    type="text"
+                                    value={act}
+                                    onChange={(e) => {
+                                      const copy = [...actions];
+                                      copy[idx] = e.target.value;
+                                      setActions(copy);
+                                      markDirty();
+                                    }}
+                                    style={{
+                                      flex: 1,
+                                      height: '28px',
+                                      padding: '0 8px',
+                                      fontSize: '12px',
+                                      borderRadius: 'var(--radius-sm)',
+                                      border: '1px solid var(--border-color)',
+                                    }}
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setActions(actions.filter((_, i) => i !== idx));
+                                      markDirty();
+                                    }}
+                                    style={{
+                                      background: 'none',
+                                      border: 'none',
+                                      color: 'var(--error-text)',
+                                      cursor: 'pointer',
+                                    }}
+                                  >
+                                    <X size={13} />
+                                  </button>
+                                </div>
+                              ))
+                            ) : (
+                              <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                                （按核心陈述执行）
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* 例外与豁免 */}
+                        <div
+                          style={{
+                            backgroundColor: '#FFFFFF',
+                            padding: '12px 14px',
+                            borderRadius: 'var(--radius-sm)',
+                            border: '1px solid var(--border-color)',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '6px',
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                            }}
+                          >
+                            <span
+                              style={{
+                                fontSize: '11px',
+                                fontWeight: 600,
+                                color: 'var(--text-secondary)',
+                              }}
+                            >
+                              例外、免责情形与禁止条件 ({exceptions.length})
+                            </span>
                             <button
                               type="button"
                               onClick={() => {
-                                setConditions(conditions.filter((_, i) => i !== idx));
+                                setExceptions([...exceptions, '']);
                                 markDirty();
                               }}
                               style={{
-                                border: 'none',
                                 background: 'none',
-                                color: 'var(--error-text)',
+                                border: 'none',
+                                fontSize: '11px',
+                                color: 'var(--brand-accent)',
                                 cursor: 'pointer',
                               }}
                             >
-                              <X size={14} />
+                              + 添加例外
                             </button>
                           </div>
-                        ))}
+                          {exceptions.length > 0 ? (
+                            exceptions.map((exc, idx) => (
+                              <div key={idx} style={{ display: 'flex', gap: '6px' }}>
+                                <input
+                                  type="text"
+                                  value={exc}
+                                  onChange={(e) => {
+                                    const copy = [...exceptions];
+                                    copy[idx] = e.target.value;
+                                    setExceptions(copy);
+                                    markDirty();
+                                  }}
+                                  style={{
+                                    flex: 1,
+                                    height: '28px',
+                                    padding: '0 8px',
+                                    fontSize: '12px',
+                                    borderRadius: 'var(--radius-sm)',
+                                    border: '1px solid var(--border-color)',
+                                  }}
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setExceptions(exceptions.filter((_, i) => i !== idx));
+                                    markDirty();
+                                  }}
+                                  style={{
+                                    background: 'none',
+                                    border: 'none',
+                                    color: 'var(--error-text)',
+                                    cursor: 'pointer',
+                                  }}
+                                >
+                                  <X size={13} />
+                                </button>
+                              </div>
+                            ))
+                          ) : (
+                            <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                              原文未特别说明例外情形（允许留空，不影响启用）
+                            </div>
+                          )}
+                        </div>
                       </div>
-                    </div>
+                    )}
 
-                    {/* 动作 */}
-                    <div>
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
-                        <label style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                          执行动作与标准
-                        </label>
-                        <button
-                          type="button"
-                          className="btn-secondary"
-                          onClick={() => {
-                            setActions([...actions, '']);
-                            markDirty();
+                    {/* 指标数据 */}
+                    {primaryCategory === '指标数据' && (
+                      <div
+                        style={{
+                          backgroundColor: '#FFFFFF',
+                          padding: '14px',
+                          borderRadius: 'var(--radius-sm)',
+                          border: '1px solid var(--border-color)',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '12px',
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: 'repeat(3, 1fr)',
+                            gap: '12px',
                           }}
-                          style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
                         >
-                          + 添加动作
-                        </button>
+                          <div>
+                            <label
+                              style={{
+                                fontSize: '11px',
+                                color: 'var(--text-secondary)',
+                                display: 'block',
+                                marginBottom: '4px',
+                              }}
+                            >
+                              计量单位
+                            </label>
+                            <input
+                              type="text"
+                              value={metricDef?.unit || ''}
+                              onChange={(e) => {
+                                setMetricDef({
+                                  ...(metricDef || { name: title, period: '', criteria: '' }),
+                                  unit: e.target.value,
+                                });
+                                markDirty();
+                              }}
+                              placeholder="如：%、元/㎡·月、次"
+                              style={{
+                                width: '100%',
+                                height: '30px',
+                                fontSize: '12px',
+                                padding: '0 8px',
+                                borderRadius: 'var(--radius-sm)',
+                                border: '1px solid var(--border-color)',
+                              }}
+                            />
+                          </div>
+                          <div>
+                            <label
+                              style={{
+                                fontSize: '11px',
+                                color: 'var(--text-secondary)',
+                                display: 'block',
+                                marginBottom: '4px',
+                              }}
+                            >
+                              统计期间
+                            </label>
+                            <input
+                              type="text"
+                              value={metricDef?.period || ''}
+                              onChange={(e) => {
+                                setMetricDef({
+                                  ...(metricDef || { name: title, unit: '', criteria: '' }),
+                                  period: e.target.value,
+                                });
+                                markDirty();
+                              }}
+                              placeholder="如：月度、季度、年度"
+                              style={{
+                                width: '100%',
+                                height: '30px',
+                                fontSize: '12px',
+                                padding: '0 8px',
+                                borderRadius: 'var(--radius-sm)',
+                                border: '1px solid var(--border-color)',
+                              }}
+                            />
+                          </div>
+                          <div>
+                            <label
+                              style={{
+                                fontSize: '11px',
+                                color: 'var(--text-secondary)',
+                                display: 'block',
+                                marginBottom: '4px',
+                              }}
+                            >
+                              达标基准 / 警戒线
+                            </label>
+                            <input
+                              type="text"
+                              value={metricDef?.criteria || ''}
+                              onChange={(e) => {
+                                setMetricDef({
+                                  ...(metricDef || { name: title, unit: '', period: '' }),
+                                  criteria: e.target.value,
+                                });
+                                markDirty();
+                              }}
+                              placeholder="如：≥ 95%、小于 24 小时"
+                              style={{
+                                width: '100%',
+                                height: '30px',
+                                fontSize: '12px',
+                                padding: '0 8px',
+                                borderRadius: 'var(--radius-sm)',
+                                border: '1px solid var(--border-color)',
+                              }}
+                            />
+                          </div>
+                        </div>
                       </div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    )}
+
+                    {/* 方法与工具 */}
+                    {primaryCategory === '方法与工具' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                        <div
+                          style={{
+                            backgroundColor: '#FFFFFF',
+                            padding: '12px 14px',
+                            borderRadius: 'var(--radius-sm)',
+                            border: '1px solid var(--border-color)',
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              marginBottom: '6px',
+                            }}
+                          >
+                            <span
+                              style={{
+                                fontSize: '11px',
+                                fontWeight: 600,
+                                color: 'var(--text-secondary)',
+                              }}
+                            >
+                              实施步骤与关键操作 ({actions.length})
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setActions([...actions, '']);
+                                markDirty();
+                              }}
+                              style={{
+                                background: 'none',
+                                border: 'none',
+                                fontSize: '11px',
+                                color: 'var(--brand-accent)',
+                                cursor: 'pointer',
+                              }}
+                            >
+                              + 增加步骤
+                            </button>
+                          </div>
+                          {actions.map((act, idx) => (
+                            <div
+                              key={idx}
+                              style={{ display: 'flex', gap: '6px', marginBottom: '4px' }}
+                            >
+                              <span
+                                style={{
+                                  fontSize: '11px',
+                                  color: 'var(--text-muted)',
+                                  lineHeight: '28px',
+                                  width: '18px',
+                                }}
+                              >
+                                {idx + 1}.
+                              </span>
+                              <input
+                                type="text"
+                                value={act}
+                                onChange={(e) => {
+                                  const copy = [...actions];
+                                  copy[idx] = e.target.value;
+                                  setActions(copy);
+                                  markDirty();
+                                }}
+                                style={{
+                                  flex: 1,
+                                  height: '28px',
+                                  padding: '0 8px',
+                                  fontSize: '12px',
+                                  borderRadius: 'var(--radius-sm)',
+                                  border: '1px solid var(--border-color)',
+                                }}
+                              />
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setActions(actions.filter((_, i) => i !== idx));
+                                  markDirty();
+                                }}
+                                style={{
+                                  background: 'none',
+                                  border: 'none',
+                                  color: 'var(--error-text)',
+                                  cursor: 'pointer',
+                                }}
+                              >
+                                <X size={13} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 项目案例 */}
+                    {primaryCategory === '项目案例' && (
+                      <div
+                        style={{
+                          backgroundColor: '#FFFFFF',
+                          padding: '14px',
+                          borderRadius: 'var(--radius-sm)',
+                          border: '1px solid var(--border-color)',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '10px',
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: '1fr 1fr',
+                            gap: '12px',
+                          }}
+                        >
+                          <div>
+                            <label
+                              style={{
+                                fontSize: '11px',
+                                color: 'var(--text-secondary)',
+                                display: 'block',
+                                marginBottom: '4px',
+                              }}
+                            >
+                              项目背景与面临挑战
+                            </label>
+                            <textarea
+                              rows={2}
+                              value={caseDetails?.background || ''}
+                              onChange={(e) => {
+                                setCaseDetails({
+                                  ...(caseDetails || {
+                                    actions: '',
+                                    results: '',
+                                    limitations: '',
+                                    background: '',
+                                  }),
+                                  background: e.target.value,
+                                });
+                                markDirty();
+                              }}
+                              style={{
+                                width: '100%',
+                                padding: '6px 8px',
+                                fontSize: '12px',
+                                borderRadius: 'var(--radius-sm)',
+                                border: '1px solid var(--border-color)',
+                              }}
+                            />
+                          </div>
+                          <div>
+                            <label
+                              style={{
+                                fontSize: '11px',
+                                color: 'var(--text-secondary)',
+                                display: 'block',
+                                marginBottom: '4px',
+                              }}
+                            >
+                              成效与经验教训
+                            </label>
+                            <textarea
+                              rows={2}
+                              value={caseDetails?.results || ''}
+                              onChange={(e) => {
+                                setCaseDetails({
+                                  ...(caseDetails || {
+                                    background: '',
+                                    actions: '',
+                                    limitations: '',
+                                    results: '',
+                                  }),
+                                  results: e.target.value,
+                                });
+                                markDirty();
+                              }}
+                              style={{
+                                width: '100%',
+                                padding: '6px 8px',
+                                fontSize: '12px',
+                                borderRadius: 'var(--radius-sm)',
+                                border: '1px solid var(--border-color)',
+                              }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 专家经验 */}
+                    {primaryCategory === '专家经验' && (
+                      <div
+                        style={{
+                          backgroundColor: '#FFFFFF',
+                          padding: '14px',
+                          borderRadius: 'var(--radius-sm)',
+                          border: '1px solid var(--border-color)',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '10px',
+                        }}
+                      >
+                        <div
+                          style={{
+                            fontSize: '11px',
+                            fontWeight: 600,
+                            color: 'var(--text-secondary)',
+                          }}
+                        >
+                          核心建议与实战要点
+                        </div>
                         {actions.map((act, idx) => (
                           <div key={idx} style={{ display: 'flex', gap: '6px' }}>
                             <input
@@ -937,13 +1926,11 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                               }}
                               style={{
                                 flex: 1,
-                                height: '30px',
-                                padding: '0 10px',
+                                height: '28px',
+                                padding: '0 8px',
                                 fontSize: '12px',
                                 borderRadius: 'var(--radius-sm)',
                                 border: '1px solid var(--border-color)',
-                                backgroundColor: '#FFFFFF',
-                                outline: 'none',
                               }}
                             />
                             <button
@@ -953,161 +1940,80 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                                 markDirty();
                               }}
                               style={{
-                                border: 'none',
                                 background: 'none',
+                                border: 'none',
                                 color: 'var(--error-text)',
                                 cursor: 'pointer',
                               }}
                             >
-                              <X size={14} />
+                              <X size={13} />
                             </button>
                           </div>
                         ))}
                       </div>
-                    </div>
+                    )}
 
-                    {/* 例外与禁止 */}
-                    <div>
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
-                        <label style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                          例外、禁止情形与停止条件
-                        </label>
-                        <button
-                          type="button"
-                          className="btn-secondary"
-                          onClick={() => {
-                            setExceptions([...exceptions, '']);
-                            markDirty();
-                          }}
-                          style={{ height: '24px', fontSize: '11px', padding: '0 8px' }}
-                        >
-                          + 添加例外
-                        </button>
-                      </div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                        {exceptions.map((exc, idx) => (
-                          <div key={idx} style={{ display: 'flex', gap: '6px' }}>
-                            <input
-                              type="text"
-                              value={exc}
-                              onChange={(e) => {
-                                const copy = [...exceptions];
-                                copy[idx] = e.target.value;
-                                setExceptions(copy);
-                                markDirty();
-                              }}
-                              style={{
-                                flex: 1,
-                                height: '30px',
-                                padding: '0 10px',
-                                fontSize: '12px',
-                                borderRadius: 'var(--radius-sm)',
-                                border: '1px solid var(--border-color)',
-                                backgroundColor: '#FFFFFF',
-                                outline: 'none',
-                              }}
-                            />
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setExceptions(exceptions.filter((_, i) => i !== idx));
-                                markDirty();
-                              }}
-                              style={{
-                                border: 'none',
-                                background: 'none',
-                                color: 'var(--error-text)',
-                                cursor: 'pointer',
-                              }}
-                            >
-                              <X size={14} />
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* 若为指标数据：展示口径定义 */}
-                    {primaryCategory === '指标数据' && (
+                    {/* 待分类提示 */}
+                    {!primaryCategory && (
                       <div
                         style={{
+                          padding: '16px',
                           backgroundColor: '#FFFFFF',
-                          padding: '12px',
                           borderRadius: 'var(--radius-sm)',
-                          border: '1px solid var(--border-color)',
-                          display: 'flex',
-                          flexDirection: 'column',
-                          gap: '10px',
+                          border: '1px dashed #FCD34D',
+                          fontSize: '12px',
+                          color: 'var(--warning-text)',
+                          textAlign: 'center',
                         }}
                       >
-                        <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-primary)' }}>
-                          指标口径规范
-                        </div>
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '10px' }}>
-                          <div>
-                            <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block' }}>
-                              计量单位
-                            </label>
-                            <input
-                              type="text"
-                              value={metricDef?.unit || ''}
-                              onChange={(e) => {
-                                setMetricDef({ ...(metricDef || { name: title, period: '', criteria: '' }), unit: e.target.value });
-                                markDirty();
-                              }}
-                              style={{ width: '100%', height: '28px', fontSize: '12px', padding: '0 8px' }}
-                            />
-                          </div>
-                          <div>
-                            <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block' }}>
-                              统计期间
-                            </label>
-                            <input
-                              type="text"
-                              value={metricDef?.period || ''}
-                              onChange={(e) => {
-                                setMetricDef({ ...(metricDef || { name: title, unit: '', criteria: '' }), period: e.target.value });
-                                markDirty();
-                              }}
-                              style={{ width: '100%', height: '28px', fontSize: '12px', padding: '0 8px' }}
-                            />
-                          </div>
-                          <div>
-                            <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block' }}>
-                              达标基准
-                            </label>
-                            <input
-                              type="text"
-                              value={metricDef?.criteria || ''}
-                              onChange={(e) => {
-                                setMetricDef({ ...(metricDef || { name: title, unit: '', period: '' }), criteria: e.target.value });
-                                markDirty();
-                              }}
-                              style={{ width: '100%', height: '28px', fontSize: '12px', padding: '0 8px' }}
-                            />
-                          </div>
-                        </div>
+                        请在上方指定具体分类（如「制度与标准」或「指标数据」），以启用针对性结构要素核对。
                       </div>
                     )}
                   </div>
 
-                  {/* 业务标签与权限管理 */}
+                  {/* 5. 业务标签与权限 */}
                   <div
                     style={{
                       border: '1px solid var(--border-color)',
                       borderRadius: 'var(--radius-md)',
-                      padding: '16px',
+                      padding: '14px 18px',
+                      backgroundColor: '#FFFFFF',
                       display: 'flex',
                       flexDirection: 'column',
-                      gap: '12px',
+                      gap: '10px',
                     }}
                   >
-                    <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-primary)' }}>
-                      业务标签与适用权限
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                      }}
+                    >
+                      <span
+                        style={{
+                          fontSize: '12px',
+                          fontWeight: 600,
+                          color: 'var(--text-secondary)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '4px',
+                        }}
+                      >
+                        <Tag size={13} />
+                        <span>业务标签与权限管理</span>
+                      </span>
                     </div>
 
-                    {/* 标签添加与展示 */}
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' }}>
+                    {/* 标签列表 */}
+                    <div
+                      style={{
+                        display: 'flex',
+                        flexWrap: 'wrap',
+                        gap: '6px',
+                        alignItems: 'center',
+                      }}
+                    >
                       {customerTypes.map((t) => (
                         <span
                           key={`c_${t}`}
@@ -1124,7 +2030,14 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                           }}
                         >
                           客户: {t}
-                          <X size={11} cursor="pointer" onClick={() => { setCustomerTypes(customerTypes.filter((x) => x !== t)); markDirty(); }} />
+                          <X
+                            size={11}
+                            cursor="pointer"
+                            onClick={() => {
+                              setCustomerTypes(customerTypes.filter((x) => x !== t));
+                              markDirty();
+                            }}
+                          />
                         </span>
                       ))}
                       {businessScenes.map((t) => (
@@ -1132,8 +2045,8 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                           key={`s_${t}`}
                           style={{
                             fontSize: '11px',
-                            backgroundColor: 'var(--brand-accent-light)',
-                            color: 'var(--brand-accent)',
+                            backgroundColor: 'var(--bg-secondary)',
+                            color: 'var(--text-secondary)',
                             padding: '2px 8px',
                             borderRadius: '12px',
                             border: '1px solid var(--border-color)',
@@ -1143,7 +2056,14 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                           }}
                         >
                           场景: {t}
-                          <X size={11} cursor="pointer" onClick={() => { setBusinessScenes(businessScenes.filter((x) => x !== t)); markDirty(); }} />
+                          <X
+                            size={11}
+                            cursor="pointer"
+                            onClick={() => {
+                              setBusinessScenes(businessScenes.filter((x) => x !== t));
+                              markDirty();
+                            }}
+                          />
                         </span>
                       ))}
                       {problemTags.map((t) => (
@@ -1151,28 +2071,35 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                           key={`p_${t}`}
                           style={{
                             fontSize: '11px',
-                            backgroundColor: '#FEF3C7',
-                            color: '#92400E',
+                            backgroundColor: 'var(--bg-secondary)',
+                            color: 'var(--text-secondary)',
                             padding: '2px 8px',
                             borderRadius: '12px',
-                            border: '1px solid #FCD34D',
+                            border: '1px solid var(--border-color)',
                             display: 'flex',
                             alignItems: 'center',
                             gap: '4px',
                           }}
                         >
                           问题: {t}
-                          <X size={11} cursor="pointer" onClick={() => { setProblemTags(problemTags.filter((x) => x !== t)); markDirty(); }} />
+                          <X
+                            size={11}
+                            cursor="pointer"
+                            onClick={() => {
+                              setProblemTags(problemTags.filter((x) => x !== t));
+                              markDirty();
+                            }}
+                          />
                         </span>
                       ))}
                     </div>
 
                     {/* 添加标签输入栏 */}
-                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '4px' }}>
+                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                       <select
                         value={tagType}
                         onChange={(e) => setTagType(e.target.value as any)}
-                        style={{ height: '30px', fontSize: '12px', padding: '0 8px' }}
+                        style={{ height: '28px', fontSize: '11px', padding: '0 6px' }}
                       >
                         <option value="scene">业务场景</option>
                         <option value="customer">客户类型</option>
@@ -1180,70 +2107,69 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                       </select>
                       <input
                         type="text"
-                        placeholder="输入新标签名称..."
+                        placeholder="输入新标签按回车添加..."
                         value={tagInput}
                         onChange={(e) => setTagInput(e.target.value)}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter') handleAddTag();
                         }}
-                        style={{ flex: 1, height: '30px', fontSize: '12px', padding: '0 10px' }}
+                        style={{
+                          flex: 1,
+                          height: '28px',
+                          fontSize: '12px',
+                          padding: '0 8px',
+                          borderRadius: 'var(--radius-sm)',
+                          border: '1px solid var(--border-color)',
+                        }}
                       />
                       <button
                         type="button"
                         className="btn-secondary"
                         onClick={handleAddTag}
-                        style={{ height: '30px', fontSize: '12px' }}
+                        style={{ height: '28px', fontSize: '11px', padding: '0 10px' }}
                       >
-                        添加标签
+                        添加
                       </button>
                     </div>
 
-                    {/* 权限范围与关联业务能力状态 */}
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginTop: '6px' }}>
-                      <div>
-                        <label style={{ fontSize: '12px', color: 'var(--text-secondary)', display: 'block', marginBottom: '4px' }}>
-                          访问权限控制
-                        </label>
-                        <select
-                          value={accessScope}
-                          onChange={(e) => {
-                            setAccessScope(e.target.value as any);
-                            markDirty();
-                          }}
-                          style={{ width: '100%', height: '32px', fontSize: '12px', padding: '0 8px' }}
-                        >
-                          <option value="admin_only">仅管理员可见</option>
-                          <option value="org_internal">企业内部全员可用</option>
-                        </select>
-                      </div>
-
-                      <div>
-                        <label style={{ fontSize: '12px', color: 'var(--text-secondary)', display: 'block', marginBottom: '4px' }}>
-                          关联业务能力组件（真实状态）
-                        </label>
-                        <div
-                          style={{
-                            height: '32px',
-                            display: 'flex',
-                            alignItems: 'center',
-                            fontSize: '12px',
-                            color: 'var(--text-muted)',
-                            backgroundColor: 'var(--bg-secondary)',
-                            padding: '0 10px',
-                            borderRadius: 'var(--radius-sm)',
-                          }}
-                        >
-                          暂无能力组件引用（待后续阶段联调）
-                        </div>
-                      </div>
+                    {/* 权限选择 */}
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        paddingTop: '8px',
+                        borderTop: '1px solid var(--bg-secondary)',
+                      }}
+                    >
+                      <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                        访问权限控制
+                      </span>
+                      <select
+                        value={accessScope}
+                        onChange={(e) => {
+                          setAccessScope(e.target.value as any);
+                          markDirty();
+                        }}
+                        style={{
+                          height: '28px',
+                          fontSize: '11px',
+                          padding: '0 8px',
+                          borderRadius: 'var(--radius-sm)',
+                          border: '1px solid var(--border-color)',
+                        }}
+                      >
+                        <option value="admin_only">仅管理员可见</option>
+                        <option value="org_internal">企业内部全员可用</option>
+                      </select>
                     </div>
                   </div>
                 </div>
 
-                {/* 底部操作区：保存草稿、确认知识、删除 */}
+                {/* 底部操作栏（支持上一条/下一条与连续核对） */}
                 <div
                   style={{
-                    padding: '14px 24px',
+                    padding: '12px 24px',
                     borderTop: '1px solid var(--border-color)',
                     display: 'flex',
                     alignItems: 'center',
@@ -1251,23 +2177,103 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                     backgroundColor: '#FFFFFF',
                   }}
                 >
-                  <button
-                    type="button"
-                    onClick={handleDelete}
-                    disabled={deleting}
-                    className="btn-secondary"
-                    style={{
-                      height: '34px',
-                      fontSize: '12px',
-                      color: 'var(--error-text)',
-                      borderColor: 'var(--border-color)',
-                      gap: '4px',
-                    }}
-                  >
-                    <Trash2 size={13} />
-                    <span>{deleting ? '正在删除...' : '删除条目'}</span>
-                  </button>
+                  {/* 左侧：连续核对导航与排除 */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    {itemList && itemList.length > 0 && (
+                      <div
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          paddingRight: '12px',
+                          borderRight: '1px solid var(--border-color)',
+                        }}
+                      >
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => hasPrev && navigateTo(itemList[currentIndex - 1])}
+                          disabled={!hasPrev}
+                          title="上一条 (Alt + ←)"
+                          style={{
+                            height: '32px',
+                            padding: '0 8px',
+                            fontSize: '11px',
+                            gap: '2px',
+                          }}
+                        >
+                          <ChevronLeft size={14} />
+                          <span>上一条</span>
+                        </button>
 
+                        <span
+                          style={{
+                            fontSize: '12px',
+                            color: 'var(--text-secondary)',
+                            fontWeight: 500,
+                            padding: '0 4px',
+                          }}
+                        >
+                          第 {currentIndex + 1} / {itemList.length} 条
+                        </span>
+
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => hasNext && navigateTo(itemList[currentIndex + 1])}
+                          disabled={!hasNext}
+                          title="下一条 (Alt + →)"
+                          style={{
+                            height: '32px',
+                            padding: '0 8px',
+                            fontSize: '11px',
+                            gap: '2px',
+                          }}
+                        >
+                          <span>下一条</span>
+                          <ChevronRight size={14} />
+                        </button>
+                      </div>
+                    )}
+
+                    {/* 暂不处理（跳到下一条） */}
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={handleSkip}
+                      title="暂不保存修改，直接看下一条"
+                      style={{
+                        height: '32px',
+                        fontSize: '11px',
+                        padding: '0 10px',
+                        color: 'var(--text-secondary)',
+                      }}
+                    >
+                      暂不处理
+                    </button>
+
+                    {/* 不收录（排除） */}
+                    <button
+                      type="button"
+                      onClick={() => setShowExcludeModal(true)}
+                      className="btn-secondary"
+                      title="排除此条知识候选，不计入待核对队列"
+                      style={{
+                        height: '32px',
+                        fontSize: '11px',
+                        padding: '0 10px',
+                        color: '#B91C1C',
+                        borderColor: '#FECACA',
+                        backgroundColor: '#FEF2F2',
+                        gap: '4px',
+                      }}
+                    >
+                      <Ban size={12} />
+                      <span>不收录</span>
+                    </button>
+                  </div>
+
+                  {/* 右侧：保存草稿、确认启用 */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                     <button
                       type="button"
@@ -1281,17 +2287,30 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                       <span>{saving ? '保存中...' : '保存草稿'}</span>
                     </button>
 
-                    <button
-                      type="button"
-                      data-testid="confirm-knowledge-btn"
-                      className="btn-primary"
-                      onClick={handleConfirm}
-                      disabled={confirming || saving}
-                      style={{ height: '34px', fontSize: '12px', gap: '4px' }}
-                    >
-                      <CheckCircle2 size={13} />
-                      <span>{confirming ? '正在校验确认...' : '确认知识版本'}</span>
-                    </button>
+                    <div style={{ position: 'relative' }}>
+                      <button
+                        type="button"
+                        data-testid="confirm-knowledge-btn"
+                        className="btn-primary"
+                        onClick={handleConfirm}
+                        disabled={confirming || saving || qualityCheck.isBlocked}
+                        style={{
+                          height: '34px',
+                          fontSize: '12px',
+                          gap: '4px',
+                          opacity: qualityCheck.isBlocked ? 0.55 : 1,
+                          cursor: qualityCheck.isBlocked ? 'not-allowed' : 'pointer',
+                        }}
+                        title={
+                          qualityCheck.isBlocked
+                            ? `无法启用：${qualityCheck.blocking[0]}`
+                            : '核对无误，确认并启用知识'
+                        }
+                      >
+                        <CheckCircle2 size={13} />
+                        <span>{confirming ? '正在确认启用...' : '确认内容并启用'}</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1300,14 +2319,158 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
         </div>
       </div>
 
+      {/* 不收录确认弹窗 */}
+      {showExcludeModal && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.55)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1100,
+          }}
+        >
+          <div
+            style={{
+              width: '440px',
+              backgroundColor: '#FFFFFF',
+              borderRadius: 'var(--radius-lg)',
+              boxShadow: '0 12px 36px rgba(0, 0, 0, 0.2)',
+              padding: '24px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '16px',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <div
+                style={{
+                  width: '36px',
+                  height: '36px',
+                  borderRadius: '50%',
+                  backgroundColor: '#FEF2F2',
+                  color: '#DC2626',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  flexShrink: 0,
+                }}
+              >
+                <Ban size={18} />
+              </div>
+              <div>
+                <div style={{ fontSize: '15px', fontWeight: 700, color: 'var(--text-primary)' }}>
+                  排除此条知识（不收录）
+                </div>
+                <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '2px' }}>
+                  排除后将移出待核对队列和分类统计，后续重试不会自动复活。
+                </div>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-primary)' }}>
+                请选择排除原因：
+              </span>
+              {EXCLUSION_REASONS.map((r) => (
+                <label
+                  key={r}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    fontSize: '12px',
+                    color: 'var(--text-primary)',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="exclude_reason"
+                    checked={selectedExcludeReason === r}
+                    onChange={() => setSelectedExcludeReason(r)}
+                  />
+                  <span>{r}</span>
+                </label>
+              ))}
+
+              {selectedExcludeReason === '其他原因' && (
+                <input
+                  type="text"
+                  placeholder="请简要说明不收录的原因..."
+                  value={customExcludeReason}
+                  onChange={(e) => setCustomExcludeReason(e.target.value)}
+                  style={{
+                    height: '30px',
+                    padding: '0 8px',
+                    fontSize: '12px',
+                    borderRadius: 'var(--radius-sm)',
+                    border: '1px solid var(--border-color)',
+                    marginTop: '4px',
+                  }}
+                />
+              )}
+            </div>
+
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'flex-end',
+                gap: '10px',
+                marginTop: '8px',
+              }}
+            >
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => setShowExcludeModal(false)}
+                disabled={deleting}
+                style={{ height: '32px', fontSize: '12px' }}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmExclude}
+                disabled={deleting}
+                style={{
+                  height: '32px',
+                  fontSize: '12px',
+                  padding: '0 14px',
+                  borderRadius: 'var(--radius-sm)',
+                  backgroundColor: '#DC2626',
+                  color: '#FFFFFF',
+                  border: 'none',
+                  cursor: 'pointer',
+                  fontWeight: 600,
+                }}
+              >
+                {deleting ? '正在排除...' : '确认不收录'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 未保存离开确认弹窗 */}
       <UnsavedChangesModal
         isOpen={showUnsavedPrompt}
-        onKeepEditing={() => setShowUnsavedPrompt(false)}
+        onKeepEditing={() => {
+          setShowUnsavedPrompt(false);
+          setPendingNextId(null);
+        }}
         onDiscard={() => {
           setShowUnsavedPrompt(false);
           setIsDirty(false);
-          onClose();
+          if (pendingNextId && onSelectNext) {
+            const next = pendingNextId;
+            setPendingNextId(null);
+            onSelectNext(next);
+          } else {
+            onClose();
+          }
         }}
         onSave={handleSaveDraft}
         saving={saving}

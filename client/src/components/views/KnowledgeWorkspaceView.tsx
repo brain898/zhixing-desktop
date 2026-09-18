@@ -1,23 +1,27 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, BookOpen, FileCode } from 'lucide-react';
+import { Plus } from 'lucide-react';
 import { api } from '../../services/api';
 import { DocumentItem, DocumentDetail } from '../../types';
 import { EmptyKnowledgeView } from './EmptyKnowledgeView';
 import { DocumentSidebar } from './documents/DocumentSidebar';
-import { DocumentDetailPane } from './documents/DocumentDetailPane';
 import { KnowledgeListPane } from './knowledge/KnowledgeListPane';
+import { DocumentDetailModal } from './documents/DocumentDetailModal';
 import { UploadModal } from './documents/UploadModal';
 import { DeleteConfirmModal } from './documents/DeleteConfirmModal';
 
 export const KnowledgeWorkspaceView: React.FC = () => {
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
-  const [viewMode, setViewMode] = useState<'knowledge' | 'pipeline'>('knowledge');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const [isUploadOpen, setIsUploadOpen] = useState(false);
   const [docToDelete, setDocToDelete] = useState<DocumentDetail | null>(null);
+
+  // 原文预览与处理详情模态抽屉
+  const [detailDocId, setDetailDocId] = useState<string | null>(null);
+  const [detailDefaultTab, setDetailDefaultTab] = useState<'preview' | 'pipeline'>('preview');
+  const [isDetailModalOpen, setIsDetailModalOpen] = useState(false);
 
   const fetchDocuments = async (autoSelectFirst = false) => {
     try {
@@ -52,6 +56,12 @@ export const KnowledgeWorkspaceView: React.FC = () => {
     return () => clearInterval(timer);
   }, [documents]);
 
+  const handleOpenDetailModal = (docId: string, tab: 'preview' | 'pipeline' = 'preview') => {
+    setDetailDocId(docId);
+    setDetailDefaultTab(tab);
+    setIsDetailModalOpen(true);
+  };
+
   if (loading) {
     return (
       <div
@@ -84,14 +94,21 @@ export const KnowledgeWorkspaceView: React.FC = () => {
         }}
       >
         <div style={{ color: 'var(--error-text)', fontSize: 'var(--font-size-sm)' }}>{error}</div>
-        <button className="btn-secondary" onClick={() => { setLoading(true); setError(null); fetchDocuments(true); }}>
+        <button
+          className="btn-secondary"
+          onClick={() => {
+            setLoading(true);
+            setError(null);
+            fetchDocuments(true);
+          }}
+        >
           重试
         </button>
       </div>
     );
   }
 
-  // 严格遵守 AC01：无资料时主工作区仅显示引导语与导入按钮
+  // 严格遵守 AC01：全新无资料时主工作区仅显示一句引导语与导入按钮
   if (documents.length === 0) {
     return (
       <>
@@ -110,10 +127,10 @@ export const KnowledgeWorkspaceView: React.FC = () => {
 
   const selectedDoc = documents.find((d) => d.id === selectedDocId) || null;
 
-  // 有真实资料时展示两栏工作区
+  // 有资料时呈现两栏工作区
   return (
     <div style={{ flex: 1, height: '100%', display: 'flex', flexDirection: 'column', backgroundColor: '#FFFFFF' }}>
-      {/* 顶部全局页头 */}
+      {/* 顶部统一页头：无多余的技术标签切换，直接提供全局导入动作 */}
       <div
         style={{
           height: '76px',
@@ -134,124 +151,45 @@ export const KnowledgeWorkspaceView: React.FC = () => {
           </p>
         </div>
 
-        {/* 视图切换器：知识资产与校对 VS 原件与结构块 */}
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            backgroundColor: 'var(--bg-secondary)',
-            padding: '3px',
-            borderRadius: 'var(--radius-md)',
-            border: '1px solid var(--border-color)',
-            gap: '4px',
-          }}
-        >
-          <button
-            type="button"
-            data-testid="mode-tab-knowledge"
-            onClick={() => setViewMode('knowledge')}
-            style={{
-              padding: '6px 14px',
-              fontSize: '13px',
-              fontWeight: viewMode === 'knowledge' ? 600 : 400,
-              borderRadius: 'var(--radius-sm)',
-              border: 'none',
-              backgroundColor: viewMode === 'knowledge' ? '#FFFFFF' : 'transparent',
-              color: viewMode === 'knowledge' ? 'var(--brand-accent)' : 'var(--text-secondary)',
-              boxShadow: viewMode === 'knowledge' ? '0 1px 3px rgba(0,0,0,0.08)' : 'none',
-              cursor: 'pointer',
-              transition: 'all 120ms ease',
-            }}
-          >
-            知识资产与校对
-          </button>
-          <button
-            type="button"
-            data-testid="mode-tab-pipeline"
-            onClick={() => {
-              if (!selectedDocId && documents.length > 0) {
-                setSelectedDocId(documents[0].id);
-              }
-              setViewMode('pipeline');
-            }}
-            style={{
-              padding: '6px 14px',
-              fontSize: '13px',
-              fontWeight: viewMode === 'pipeline' ? 600 : 400,
-              borderRadius: 'var(--radius-sm)',
-              border: 'none',
-              backgroundColor: viewMode === 'pipeline' ? '#FFFFFF' : 'transparent',
-              color: viewMode === 'pipeline' ? 'var(--brand-accent)' : 'var(--text-secondary)',
-              boxShadow: viewMode === 'pipeline' ? '0 1px 3px rgba(0,0,0,0.08)' : 'none',
-              cursor: 'pointer',
-              transition: 'all 120ms ease',
-            }}
-          >
-            原件与结构块
-          </button>
-        </div>
-
         <button className="btn-primary" onClick={() => setIsUploadOpen(true)}>
           <Plus size={16} />
           <span>导入文件</span>
         </button>
       </div>
 
-      {/* 主体两栏工作区 */}
+      {/* 主体两栏工作区：左栏原始资料，右栏知识整理结果 */}
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-        {/* 左栏：真实原始文件列表 */}
+        {/* 左栏：原始资料列表 */}
         <DocumentSidebar
           documents={documents}
           selectedDocId={selectedDocId}
           onSelectDoc={(id) => setSelectedDocId(id)}
           onOpenUpload={() => setIsUploadOpen(true)}
+          onOpenPreview={(id) => handleOpenDetailModal(id, 'preview')}
         />
 
-        {/* 右栏：根据模式展示知识资产卡片流或原始文档结构块 */}
-        {viewMode === 'knowledge' ? (
-          <KnowledgeListPane
-            selectedDoc={selectedDoc}
-            onClearDocSelection={() => setSelectedDocId(null)}
-            onSwitchToDocPipeline={() => {
-              if (!selectedDocId && documents.length > 0) {
-                setSelectedDocId(documents[0].id);
-              }
-              setViewMode('pipeline');
-            }}
-          />
-        ) : selectedDocId ? (
-          <DocumentDetailPane
-            key={selectedDocId}
-            documentId={selectedDocId}
-            onDeleteRequested={(doc) => setDocToDelete(doc)}
-            onRefreshList={() => fetchDocuments(false)}
-          />
-        ) : (
-          <div
-            style={{
-              flex: 1,
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              justifyContent: 'center',
-              color: 'var(--text-muted)',
-              fontSize: '13px',
-              gap: '12px',
-            }}
-          >
-            <div>请在左侧选择文件以查看原始文件与结构块详情</div>
-            {documents.length > 0 && (
-              <button
-                type="button"
-                className="btn-secondary"
-                onClick={() => setSelectedDocId(documents[0].id)}
-              >
-                查看首个文件
-              </button>
-            )}
-          </div>
-        )}
+        {/* 右栏：知识整理结果与核对列表 */}
+        <KnowledgeListPane
+          selectedDoc={selectedDoc}
+          onClearDocSelection={() => setSelectedDocId(null)}
+          onOpenDocPreview={(tab) => {
+            if (selectedDocId) {
+              handleOpenDetailModal(selectedDocId, tab || 'preview');
+            } else if (documents.length > 0) {
+              handleOpenDetailModal(documents[0].id, tab || 'preview');
+            }
+          }}
+        />
       </div>
+
+      {/* 原文预览与处理详情模态弹窗 (按需呼出，不占领两栏主视图) */}
+      <DocumentDetailModal
+        documentId={detailDocId}
+        isOpen={isDetailModalOpen}
+        defaultTab={detailDefaultTab}
+        onClose={() => setIsDetailModalOpen(false)}
+        onRefreshList={() => fetchDocuments(false)}
+      />
 
       {/* 模态对话框 */}
       <UploadModal

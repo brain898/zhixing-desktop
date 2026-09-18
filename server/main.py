@@ -708,7 +708,7 @@ def list_knowledge_items(
         # 1. 基础查询条件
         where_clauses = [
             "ki.organization_id = ?",
-            "ki.lifecycle_status != 'deleted'",
+            "ki.lifecycle_status NOT IN ('deleted', 'excluded')",
             "d.is_deleted = 0"
         ]
         params: List[Any] = [org_id]
@@ -793,7 +793,7 @@ def list_knowledge_items(
             })
 
         # 2. 全量统计（基于当前企业下未删除的有效资料范围）
-        scope_where = ["ki.organization_id = ?", "ki.lifecycle_status != 'deleted'", "d.is_deleted = 0"]
+        scope_where = ["ki.organization_id = ?", "ki.lifecycle_status NOT IN ('deleted', 'excluded')", "d.is_deleted = 0"]
         scope_params = [org_id]
         if document_id:
             scope_where.append("ki.document_id = ?")
@@ -1157,7 +1157,10 @@ def confirm_knowledge_item(
 
         # 门槛 4：关键阻塞性质检问题检查
         q_flags = json.loads(curr["quality_flags_json"] or "[]")
-        blocking_issues = [f for f in q_flags if "伪造来源" in f or "不匹配" in f or "冲突" in f]
+        blocking_issues = [
+            f for f in q_flags
+            if any(k in f for k in ("伪造来源", "不匹配", "冲突", "无效提取", "缺乏有效原文证据", "无实质业务"))
+        ]
         if blocking_issues:
             raise HTTPException(
                 status_code=400,
@@ -1187,28 +1190,45 @@ def confirm_knowledge_item(
     }
 
 @app.delete("/api/knowledge/items/{item_id}")
-def delete_knowledge_item(item_id: str, admin: Dict[str, Any] = Depends(require_admin)):
+def delete_knowledge_item(
+    item_id: str,
+    action_type: Optional[str] = "delete",
+    reason: Optional[str] = None,
+    admin: Dict[str, Any] = Depends(require_admin)
+):
     """
-    逻辑删除知识条目：
-    删除后不再计入维护列表与分类统计，撤销后续检索与日常访问资格。
+    逻辑删除或排除（不收录）知识条目：
+    删除或排除后不再计入日常维护列表与分类统计，撤销后续检索资格，且后续重试不会自动复活。
     """
     org_id = admin["organization_id"]
     now_iso = datetime.now(timezone.utc).isoformat()
+    status_to_set = "excluded" if action_type == "exclude" else "deleted"
     with get_db() as conn:
         item = conn.execute(
-            "SELECT id FROM knowledge_items WHERE id = ? AND organization_id = ? AND lifecycle_status != 'deleted'",
+            "SELECT id, active_version_id FROM knowledge_items WHERE id = ? AND organization_id = ? AND lifecycle_status NOT IN ('deleted', 'excluded')",
             (item_id, org_id)
         ).fetchone()
 
         if not item:
-            raise HTTPException(status_code=404, detail="知识条目不存在或已被删除")
+            raise HTTPException(status_code=404, detail="知识条目不存在或已被处理")
 
         conn.execute(
-            "UPDATE knowledge_items SET lifecycle_status = 'deleted', deleted_at = ?, deleted_by = ? WHERE id = ?",
-            (now_iso, admin["id"], item_id)
+            "UPDATE knowledge_items SET lifecycle_status = ?, deleted_at = ?, deleted_by = ? WHERE id = ?",
+            (status_to_set, now_iso, admin["id"], item_id)
         )
 
-    return {"message": "知识条目已成功删除", "id": item_id}
+        if reason and item["active_version_id"]:
+            # 记录排除/删除原因至版本说明
+            curr_v = conn.execute("SELECT quality_flags_json FROM knowledge_versions WHERE id = ?", (item["active_version_id"],)).fetchone()
+            q_list = json.loads(curr_v["quality_flags_json"] or "[]") if curr_v else []
+            q_list.append(f"管理员操作「{'不收录' if action_type == 'exclude' else '删除'}」: {reason}")
+            conn.execute(
+                "UPDATE knowledge_versions SET quality_flags_json = ? WHERE id = ?",
+                (json.dumps(q_list, ensure_ascii=False), item["active_version_id"])
+            )
+
+    msg = "知识候选已排除（不收录）并保留记录" if action_type == "exclude" else "知识条目已成功删除"
+    return {"message": msg, "id": item_id, "status": status_to_set}
 
 @app.get("/api/knowledge/tags")
 def list_knowledge_tags(admin: Dict[str, Any] = Depends(require_admin)):

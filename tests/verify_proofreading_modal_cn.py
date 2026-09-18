@@ -54,7 +54,7 @@ def verify_modal_chinese():
             return
 
         # 等待校对弹窗打开
-        page.wait_for_selector('text="知识原子校对工作台"', timeout=8000)
+        page.wait_for_selector('text="核对知识"', timeout=8000)
         page.wait_for_timeout(1000)
 
         # 截屏保存
@@ -63,7 +63,7 @@ def verify_modal_chinese():
         print(f"校对工作台截屏保存至: {shot_path}")
 
         # 获取弹窗可见文本
-        modal = page.locator('text="知识原子校对工作台"').locator('xpath=ancestor::div[contains(@style, "width: 1280px") or contains(@style, "max-width: 96vw")]')
+        modal = page.locator('text="核对知识"').locator('xpath=ancestor::div[contains(@style, "max-width: 96vw")]')
         modal_text = modal.inner_text()
         print("\n--- 弹窗可见文本摘录 ---")
         for line in modal_text.splitlines()[:30]:

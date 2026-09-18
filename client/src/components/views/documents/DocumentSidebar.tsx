@@ -8,6 +8,7 @@ interface DocumentSidebarProps {
   selectedDocId: string | null;
   onSelectDoc: (docId: string | null) => void;
   onOpenUpload: () => void;
+  onOpenPreview?: (docId: string) => void;
 }
 
 export const DocumentSidebar: React.FC<DocumentSidebarProps> = ({
@@ -15,6 +16,7 @@ export const DocumentSidebar: React.FC<DocumentSidebarProps> = ({
   selectedDocId,
   onSelectDoc,
   onOpenUpload,
+  onOpenPreview,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
 
@@ -68,35 +70,23 @@ export const DocumentSidebar: React.FC<DocumentSidebarProps> = ({
         return (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: 'var(--success-text)', fontSize: '11px' }}>
             <CheckCircle2 size={12} />
-            解析完成
+            整理完成
           </span>
         );
       case 'parsing':
-        return (
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: 'var(--pending-text)', fontSize: '11px' }}>
-            <RotateCw size={12} className="spin-slow" />
-            正文解析中
-          </span>
-        );
       case 'extracting':
         return (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: 'var(--brand-accent)', fontSize: '11px' }}>
             <RotateCw size={12} className="spin-slow" />
-            原子提炼中
+            正在整理
           </span>
         );
       case 'partial_failed':
-        return (
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: 'var(--error-text)', fontSize: '11px' }}>
-            <AlertCircle size={12} />
-            {'\u539f\u5b50\u63d0\u70bc\u5f02\u5e38'}
-          </span>
-        );
       case 'failed':
         return (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: 'var(--error-text)', fontSize: '11px' }}>
             <AlertCircle size={12} />
-            解析失败
+            整理失败
           </span>
         );
       case 'queued':
@@ -166,7 +156,7 @@ export const DocumentSidebar: React.FC<DocumentSidebarProps> = ({
           <Search size={14} color="var(--text-muted)" />
           <input
             type="text"
-            placeholder="搜索资料名称"
+            placeholder="搜索资料文件名..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             style={{
@@ -241,7 +231,7 @@ export const DocumentSidebar: React.FC<DocumentSidebarProps> = ({
                     marginTop: '2px',
                   }}
                 >
-                  全部已导入文件
+                  汇总查看全部已导入资料
                 </div>
               </div>
             </div>
@@ -276,22 +266,55 @@ export const DocumentSidebar: React.FC<DocumentSidebarProps> = ({
                     border: `1px solid ${isSelected ? 'var(--brand-accent)' : 'var(--border-color)'}`,
                     cursor: 'pointer',
                     transition: 'all 120ms ease',
+                    position: 'relative',
                   }}
                 >
                   {getFormatBadge(doc.file_type)}
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div
-                      title={doc.title}
                       style={{
-                        fontSize: 'var(--font-size-sm)',
-                        fontWeight: 500,
-                        color: 'var(--text-primary)',
-                        whiteSpace: 'nowrap',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
                       }}
                     >
-                      {doc.title}
+                      <div
+                        title={doc.title}
+                        style={{
+                          fontSize: 'var(--font-size-sm)',
+                          fontWeight: 500,
+                          color: 'var(--text-primary)',
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          maxWidth: '170px',
+                        }}
+                      >
+                        {doc.title}
+                      </div>
+
+                      {/* 独立查看原文入口 */}
+                      {onOpenPreview && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenPreview(doc.id);
+                          }}
+                          title="查看文件原文预览与处理详情"
+                          style={{
+                            border: 'none',
+                            background: 'none',
+                            color: 'var(--brand-accent)',
+                            fontSize: '11px',
+                            cursor: 'pointer',
+                            padding: '2px 4px',
+                            borderRadius: '3px',
+                          }}
+                        >
+                          原文
+                        </button>
+                      )}
                     </div>
                     <div
                       style={{

@@ -220,8 +220,11 @@ def _parse_text(file_path: Path, is_markdown: bool = False) -> List[Dict[str, An
             text = "\n".join(current_para_lines).strip()
             if text:
                 heading_path = " / ".join([current_headings[k] for k in sorted(current_headings.keys())]) if current_headings else None
-                is_list = text.startswith(("•", "-", "*", "1.", "2.", "3.", "·"))
-                block_type = "list_item" if is_list else "paragraph"
+                if re.match(r"^[-*_=\s]{3,}$", text):
+                    block_type = "divider"
+                else:
+                    is_list = bool(re.match(r"^(\d+\.|\*|-|•|·)\s+\S", text))
+                    block_type = "list_item" if is_list else "paragraph"
                 blocks.append({
                     "block_index": block_idx,
                     "block_type": block_type,
@@ -239,7 +242,20 @@ def _parse_text(file_path: Path, is_markdown: bool = False) -> List[Dict[str, An
             flush_para()
             continue
 
-        if is_markdown and stripped.startswith("#"):
+        # 识别 Markdown 或纯文本分割线 (如 ---, ***, ___ 等)
+        if is_markdown and re.match(r"^[-*_=\s]{3,}$", stripped):
+            flush_para()
+            heading_path = " / ".join([current_headings[k] for k in sorted(current_headings.keys())]) if current_headings else None
+            blocks.append({
+                "block_index": block_idx,
+                "block_type": "divider",
+                "heading_path": heading_path,
+                "page_number": None,
+                "paragraph_anchor": f"line_{line_idx}",
+                "text_content": stripped,
+            })
+            block_idx += 1
+        elif is_markdown and stripped.startswith("#"):
             flush_para()
             level = 0
             while level < len(stripped) and stripped[level] == "#":
@@ -258,6 +274,11 @@ def _parse_text(file_path: Path, is_markdown: bool = False) -> List[Dict[str, An
             })
             block_idx += 1
         else:
+            # 判断是否为新的独立列表项
+            is_new_list_item = bool(re.match(r"^(\d+\.|\*|-|•|·)\s+\S", stripped))
+            if is_new_list_item and current_para_lines:
+                flush_para()
+
             if not current_para_lines:
                 para_start_line = line_idx
             current_para_lines.append(stripped)

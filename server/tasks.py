@@ -306,7 +306,7 @@ def execute_extract_task(task_id: str):
                 (doc_id,)
             ).fetchall()
 
-            deleted_titles = {r["title"] for r in existing_items if r["lifecycle_status"] == "deleted"}
+            deleted_titles = {r["title"] for r in existing_items if r["lifecycle_status"] in ("deleted", "excluded")}
             manual_titles = {r["title"] for r in existing_items if r["review_status"] == "confirmed" or r["reviewed_by"] is not None}
 
             # 清除该版本原有的未校对候选版本，以便更新
@@ -330,15 +330,21 @@ def execute_extract_task(task_id: str):
             )
 
             # 写入知识原子候选
+            from deepseek_extractor import is_meaningful_business_text
             for atom in sanitized_atoms:
-                # 规则 1：被删除的候选不自动复活
+                # 规则 1：被删除或已排除的候选不自动复活
                 if atom["title"] in deleted_titles:
-                    logger.info(f"Skipping atom 「{atom['title']}」: previously deleted by admin.")
+                    logger.info(f"Skipping atom 「{atom['title']}」: previously deleted/excluded by admin.")
                     continue
 
                 # 规则 2：已有且已人工校对的候选不被重试结果覆盖
                 if atom["title"] in manual_titles:
                     logger.info(f"Skipping atom 「{atom['title']}」: already reviewed/confirmed by admin.")
+                    continue
+
+                # 规则 3：完全无效的片段（无实质业务内容、纯符号/分割线等）留在处理记录中，不塞入人工核对队列
+                if not is_meaningful_business_text(atom.get("statement")):
+                    logger.info(f"Filtered invalid candidate 「{atom['title']}」: no meaningful business content, preserved in processing log.")
                     continue
 
                 item_id = f"ki_{uuid.uuid4().hex[:12]}"

@@ -20,6 +20,33 @@ VALID_PRIMARY_CATEGORIES = ["制度与标准", "方法与工具", "项目案例"
 VALID_ATOM_TYPES = ["规则", "判断", "方法", "案例", "指标", "经验"]
 VALID_FIELD_STATES = ["supported", "not_stated", "not_applicable", "failed"]
 
+def is_meaningful_business_text(text: Optional[str]) -> bool:
+    """
+    检查文本是否包含实质业务内容：
+    1. 排除 None 或纯空白字符。
+    2. 排除纯符号、纯分割线 (如 ---, ***, ===, ___, |--|--| 等)。
+    3. 排除纯数字、页码标记 (如 "第1页", "- 1 -")。
+    4. 移除所有标点符号及空白后，有效汉字或英文/数字字符数量必须 >= 4。
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # 纯符号或水平分割线
+    if re.match(r"^[-*_=\s~`|\\/#—–\.,;:!?'\"，。；：！？（）()【】\[\]<>《》]+$", stripped):
+        return False
+    # 去除所有标点符号及空白后计算实质字符数
+    clean_chars = re.sub(r"[\s\-_=*#~`|\\/—–\.,;:!?'\"，。；：！？（）()【】\[\]<>《》\^%&$@+]", "", stripped)
+    if len(clean_chars) < 4:
+        return False
+    # 排除纯数字或纯页码
+    if clean_chars.isdigit():
+        return False
+    if re.match(r"^(第?\d+[页条项篇章]|page\s*\d+)$", stripped, re.I):
+        return False
+    return True
+
 SYSTEM_PROMPT = """你是一名资深企业物业数字化与知识工程专家。你的任务是从提供的文档结构块中，提取出语义完整、边界清晰、可追溯的业务知识原子。
 
 【安全隔离铁律】
@@ -173,18 +200,22 @@ def rule_based_extract_atoms(
     candidates: List[Dict[str, Any]] = []
 
     for sb in source_blocks:
-        text = sb["text_content"].strip()
-        if not text:
+        b_type = sb.get("block_type", "paragraph")
+        # 标题与纯分割线只作为上下文或来源锚点，不作为独立业务规则候选
+        if b_type in ("divider", "heading"):
             continue
 
-        b_type = sb.get("block_type", "paragraph")
+        text = sb["text_content"].strip()
+        if not is_meaningful_business_text(text):
+            continue
+
         h_path = sb.get("heading_path") or ""
         anchor = sb.get("paragraph_anchor") or f"p_{sb.get('page_number', 1)}"
 
         # 1. 表格类结构块 -> 提炼为「指标数据」或「制度与标准」
         if b_type == "table":
             lines = [line.strip() for line in text.split("\n") if line.strip()]
-            if lines:
+            if lines and is_meaningful_business_text(lines[0]):
                 header = lines[0]
                 rows = lines[1:] if len(lines) > 1 else lines
                 title = f"{h_path or document_title} - 查验指标与标准" if h_path else "工程查验技术指标"
@@ -261,6 +292,7 @@ def rule_based_extract_atoms(
                 "metric_definition": None,
                 "case_details": None,
                 "source_evidence": [
+                    {"field_name": "statement", "source_block_id": sb["id"], "excerpt": text[:35]},
                     {"field_name": "conditions", "source_block_id": sb["id"], "excerpt": text[:35]},
                     {"field_name": "actions", "source_block_id": sb["id"], "excerpt": text[20:65] if len(text) > 40 else text[:30]},
                 ],
@@ -306,7 +338,7 @@ def rule_based_extract_atoms(
             })
 
         # C. 产生一个待分类条目（用于验证待分类区与人工校对功能）
-        elif len(candidates) < 4:
+        elif len(candidates) < 4 and len(text) >= 12 and is_meaningful_business_text(text):
             candidates.append({
                 "title": f"{h_path or '园区服务'}通则说明",
                 "primary_category": None,  # 待分类！
@@ -333,35 +365,39 @@ def rule_based_extract_atoms(
                 "problem_tags": ["综合调度"],
             })
 
-    # 兜底：如果文档很短，确保至少生成一个条目
-    if not candidates and source_blocks:
-        sb = source_blocks[0]
-        text = sb["text_content"].strip()
-        candidates.append({
-            "title": f"{document_title} 核心服务要点",
-            "primary_category": "制度与标准",
-            "atom_type": "规则",
-            "subject": "物业服务人员",
-            "statement": text[:100],
-            "conditions": ["执行物业日常服务标准期间"],
-            "actions": ["按文档规范执行并记录"],
-            "exceptions": [],
-            "metric_definition": None,
-            "case_details": None,
-            "source_evidence": [
-                {"field_name": "statement", "source_block_id": sb["id"], "excerpt": text[:30]}
-            ],
-            "field_states": {
-                "conditions": "supported",
-                "actions": "supported",
-                "exceptions": "not_stated",
-                "metric_definition": "not_applicable",
-                "case_details": "not_applicable",
-            },
-            "customer_types": ["住宅业主"],
-            "business_scenes": ["品质管控"],
-            "problem_tags": ["服务规范"],
-        })
+    # 兜底：如果文档很短但有实质内容，确保生成至少一个条目；如果全是空白/纯符号/纯分割线，绝不伪造
+    if not candidates:
+        for sb in source_blocks:
+            if sb.get("block_type") in ("divider", "heading"):
+                continue
+            text = sb["text_content"].strip()
+            if is_meaningful_business_text(text):
+                candidates.append({
+                    "title": f"{document_title} 核心服务要点",
+                    "primary_category": "制度与标准",
+                    "atom_type": "规则",
+                    "subject": "物业服务人员",
+                    "statement": text[:100],
+                    "conditions": ["执行物业日常服务标准期间"],
+                    "actions": ["按文档规范执行并记录"],
+                    "exceptions": [],
+                    "metric_definition": None,
+                    "case_details": None,
+                    "source_evidence": [
+                        {"field_name": "statement", "source_block_id": sb["id"], "excerpt": text[:30]}
+                    ],
+                    "field_states": {
+                        "conditions": "supported",
+                        "actions": "supported",
+                        "exceptions": "not_stated",
+                        "metric_definition": "not_applicable",
+                        "case_details": "not_applicable",
+                    },
+                    "customer_types": ["住宅业主"],
+                    "business_scenes": ["品质管控"],
+                    "problem_tags": ["服务规范"],
+                })
+                break
 
     extraction_context = {
         "provider": "rule-based-adapter-v1",
@@ -399,6 +435,9 @@ def validate_and_sanitize_atoms(
         statement = (item.get("statement") or "").strip()
         if not statement:
             quality_flags.append("缺少核心陈述，无法独立理解")
+            field_states["statement"] = "failed"
+        elif not is_meaningful_business_text(statement):
+            quality_flags.append("核心陈述缺乏有效业务内容，属于无效提取")
             field_states["statement"] = "failed"
         else:
             field_states["statement"] = field_states.get("statement") or "supported"
@@ -440,8 +479,12 @@ def validate_and_sanitize_atoms(
                 if anchor not in source_anchors:
                     source_anchors.append(anchor)
 
-                # 检查摘录是否匹配
-                if excerpt and excerpt not in target_block["text_content"]:
+                # 检查摘录是否有效以及是否匹配
+                if excerpt and not is_meaningful_business_text(excerpt):
+                    quality_flags.append(f"来源摘录无效: 摘录文本「{excerpt}」缺乏实质业务内容")
+                    field_states[field_name] = "failed"
+                    accuracy = "invalid"
+                elif excerpt and excerpt not in target_block["text_content"]:
                     quality_flags.append(f"来源摘录与原文块不匹配: 「{excerpt[:20]}...」")
                     field_states[field_name] = "failed"
                     accuracy = "mismatched"
@@ -456,6 +499,12 @@ def validate_and_sanitize_atoms(
                     "excerpt": excerpt,
                     "accuracy_level": accuracy,
                 })
+
+        # 核心内容必须具备真实、有效的原文证据支撑
+        has_valid_ev = any(ev["accuracy_level"] in ("exact", "referenced") for ev in valid_evidence)
+        if not has_valid_ev:
+            quality_flags.append("核心内容缺乏有效原文证据支撑，阻止启用")
+            field_states["statement"] = "failed"
 
         # E. 规范化条件、动作与例外
         conditions = item.get("conditions") or []

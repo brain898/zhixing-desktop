@@ -223,8 +223,16 @@ export const api = {
     );
   },
 
-  async deleteKnowledgeItem(itemId: string): Promise<{ message: string; id: string }> {
-    return request<{ message: string; id: string }>(`/knowledge/items/${itemId}`, {
+  async deleteKnowledgeItem(
+    itemId: string,
+    actionType: 'delete' | 'exclude' = 'delete',
+    reason?: string
+  ): Promise<{ message: string; id: string }> {
+    const params = new URLSearchParams();
+    if (actionType) params.append('action_type', actionType);
+    if (reason) params.append('reason', reason);
+    const query = params.toString() ? `?${params.toString()}` : '';
+    return request<{ message: string; id: string }>(`/knowledge/items/${itemId}${query}`, {
       method: 'DELETE',
     });
   },
