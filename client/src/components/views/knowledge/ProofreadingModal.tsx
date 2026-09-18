@@ -56,6 +56,28 @@ const EXCLUSION_REASONS = [
   '其他原因',
 ];
 
+interface MergedEvidence {
+  source_block_id: string;
+  block_index?: number;
+  block_type?: string;
+  heading_path?: string | null;
+  page_number?: number | null;
+  paragraph_anchor?: string | null;
+  text_content: string;
+  usages: Array<{ field_name: string; label: string; excerpt: string }>;
+}
+
+const FIELD_LABEL_MAP: Record<string, string> = {
+  statement: '主要结论',
+  title: '知识标题',
+  subject: '责任主体',
+  conditions: '适用条件',
+  actions: '处理动作',
+  exceptions: '特殊情况/例外',
+  metric_definition: '指标要求',
+  case_details: '案例信息',
+};
+
 export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
   itemId,
   itemList = [],
@@ -105,9 +127,47 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
   const [selectedExcludeReason, setSelectedExcludeReason] = useState(EXCLUSION_REASONS[0]);
   const [customExcludeReason, setCustomExcludeReason] = useState('');
 
-  // 标签输入
+  // 标签输入与收拢状态
   const [tagInput, setTagInput] = useState('');
   const [tagType, setTagType] = useState<'customer' | 'scene' | 'problem'>('scene');
+  const [isTagsEditing, setIsTagsEditing] = useState(false);
+  const [availableTags, setAvailableTags] = useState<{
+    customer_types: string[];
+    business_scenes: string[];
+    problem_tags: string[];
+  } | null>(null);
+  const [togglingLifecycle, setTogglingLifecycle] = useState(false);
+
+  // 原文证据按 source_block_id 分组聚合
+  const mergedEvidence = useMemo(() => {
+    if (!detail?.evidence) return [];
+    const map = new Map<string, MergedEvidence>();
+    for (const ev of detail.evidence) {
+      const key = ev.source_block_id || `block_${ev.block_index ?? Math.random()}`;
+      if (!map.has(key)) {
+        map.set(key, {
+          source_block_id: ev.source_block_id,
+          block_index: ev.block_index,
+          block_type: ev.block_type,
+          heading_path: ev.heading_path,
+          page_number: ev.page_number,
+          paragraph_anchor: ev.paragraph_anchor,
+          text_content: ev.text_content || '',
+          usages: [],
+        });
+      }
+      const item = map.get(key)!;
+      const label = FIELD_LABEL_MAP[ev.field_name] || formatFieldName(ev.field_name);
+      if (!item.usages.some((u) => u.field_name === ev.field_name && u.excerpt === ev.excerpt)) {
+        item.usages.push({
+          field_name: ev.field_name,
+          label,
+          excerpt: ev.excerpt,
+        });
+      }
+    }
+    return Array.from(map.values());
+  }, [detail?.evidence]);
 
   // 当前条目在列表中的索引
   const currentIndex = useMemo(() => {
@@ -301,10 +361,12 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
         if (!prev) return null;
         return {
           ...prev,
+          lifecycle_status: 'active',
+          is_draft_version: false,
           active_version: {
             ...prev.active_version,
             review_status: 'confirmed',
-            index_status: 'not_indexed',
+            index_status: 'ready',
             revision_token: confirmRes.revision_token,
           },
         };
@@ -320,6 +382,34 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
       alert(`确认失败: ${err.message}`);
     } finally {
       setConfirming(false);
+    }
+  };
+
+  // 停用与恢复启用
+  const handleToggleLifecycle = async () => {
+    if (!detail) return;
+    const targetStatus = detail.lifecycle_status === 'disabled' ? 'active' : 'disabled';
+    const actionText = targetStatus === 'disabled' ? '停用' : '恢复启用';
+    if (
+      !window.confirm(
+        `确认${actionText}该知识条目？${
+          targetStatus === 'disabled'
+            ? '停用后将退出正式检索，不再对外提供服务。'
+            : '恢复后将立即重新恢复正式检索服务。'
+        }`
+      )
+    ) {
+      return;
+    }
+    try {
+      setTogglingLifecycle(true);
+      await api.updateKnowledgeLifecycle(detail.id, targetStatus);
+      setDetail((prev) => (prev ? { ...prev, lifecycle_status: targetStatus } : null));
+      onSaved();
+    } catch (err: any) {
+      alert(`${actionText}失败: ${err.message}`);
+    } finally {
+      setTogglingLifecycle(false);
     }
   };
 
@@ -506,8 +596,56 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
             </div>
 
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-              {/* 审核状态 */}
-              {detail?.active_version.review_status === 'confirmed' ? (
+              {/* 停用状态标识 */}
+              {detail?.lifecycle_status === 'disabled' && (
+                <span
+                  data-testid="disabled-status-badge"
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                    fontSize: '12px',
+                    fontWeight: 600,
+                    padding: '3px 10px',
+                    borderRadius: 'var(--radius-sm)',
+                    backgroundColor: '#FEF2F2',
+                    color: '#DC2626',
+                    border: '1px solid #FECACA',
+                  }}
+                >
+                  <Ban size={13} />
+                  <span>已停用</span>
+                </span>
+              )}
+
+              {/* 草稿 / 审核状态 */}
+              {detail?.is_draft_version ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span
+                    data-testid="draft-version-badge"
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                      fontSize: '12px',
+                      fontWeight: 600,
+                      padding: '3px 10px',
+                      borderRadius: 'var(--radius-sm)',
+                      backgroundColor: 'var(--warning-bg)',
+                      color: 'var(--warning-text)',
+                      border: '1px solid #FCD34D',
+                    }}
+                  >
+                    <Clock size={13} />
+                    <span>待核对新草稿 (v{detail.active_version.version_number})</span>
+                  </span>
+                  {detail.serving_version_number && (
+                    <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                      （线上服务中：v{detail.serving_version_number}）
+                    </span>
+                  )}
+                </div>
+              ) : detail?.active_version.review_status === 'confirmed' ? (
                 <span
                   data-testid="confirmed-status-badge"
                   style={{
@@ -545,6 +683,30 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                   <Clock size={13} />
                   <span>待核对</span>
                 </span>
+              )}
+
+              {/* 停用/恢复按钮 */}
+              {detail && (detail.active_version.review_status === 'confirmed' || detail.lifecycle_status === 'disabled') && (
+                <button
+                  type="button"
+                  data-testid="toggle-lifecycle-btn"
+                  onClick={handleToggleLifecycle}
+                  disabled={togglingLifecycle}
+                  style={{
+                    fontSize: '12px',
+                    padding: '4px 10px',
+                    borderRadius: 'var(--radius-sm)',
+                    backgroundColor: detail.lifecycle_status === 'disabled' ? '#ECFDF5' : '#FEF2F2',
+                    color: detail.lifecycle_status === 'disabled' ? '#059669' : '#DC2626',
+                    border: `1px solid ${detail.lifecycle_status === 'disabled' ? '#A7F3D0' : '#FECACA'}`,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                  }}
+                >
+                  {detail.lifecycle_status === 'disabled' ? '恢复启用' : '停用知识'}
+                </button>
               )}
 
               {/* 提炼引擎标识 */}
@@ -664,7 +826,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                 >
                   <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                     <FileText size={15} color="var(--brand-accent)" />
-                    <span>原文证据对照（共 {detail?.evidence.length || 0} 处支撑）</span>
+                    <span>原文证据对照（共 {mergedEvidence.length} 处段落支撑）</span>
                   </div>
                   <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
                     不虚构页码，精确到段落与表格
@@ -681,10 +843,10 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                     gap: '16px',
                   }}
                 >
-                  {detail?.evidence && detail.evidence.length > 0 ? (
-                    detail.evidence.map((ev, idx) => (
+                  {mergedEvidence && mergedEvidence.length > 0 ? (
+                    mergedEvidence.map((ev, idx) => (
                       <div
-                        key={ev.id || idx}
+                        key={ev.source_block_id || idx}
                         style={{
                           backgroundColor: '#FFFFFF',
                           border: '1px solid var(--border-color)',
@@ -704,17 +866,36 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                             fontSize: '11px',
                           }}
                         >
-                          <span
-                            style={{
-                              fontWeight: 600,
-                              color: 'var(--brand-accent)',
-                              backgroundColor: 'var(--brand-accent-light)',
-                              padding: '2px 8px',
-                              borderRadius: 'var(--radius-sm)',
-                            }}
-                          >
-                            支撑字段：{formatFieldName(ev.field_name)}
-                          </span>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center' }}>
+                            <span
+                              style={{
+                                fontWeight: 600,
+                                color: 'var(--text-secondary)',
+                                backgroundColor: 'var(--bg-secondary)',
+                                padding: '2px 8px',
+                                borderRadius: 'var(--radius-sm)',
+                                border: '1px solid var(--border-color)',
+                              }}
+                            >
+                              段落 {ev.block_index !== undefined ? `#${ev.block_index + 1}` : ''}
+                            </span>
+                            {ev.usages.map((u, uIdx) => (
+                              <span
+                                key={uIdx}
+                                style={{
+                                  fontWeight: 500,
+                                  color: 'var(--text-primary)',
+                                  backgroundColor: 'var(--bg-secondary)',
+                                  padding: '2px 6px',
+                                  borderRadius: 'var(--radius-sm)',
+                                  border: '1px solid var(--border-color)',
+                                  fontSize: '11px',
+                                }}
+                              >
+                                [{u.label}]
+                              </span>
+                            ))}
+                          </div>
                           <span
                             style={{
                               color: 'var(--text-secondary)',
@@ -724,7 +905,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                               fontSize: '11px',
                             }}
                           >
-                            {formatAnchor(ev.paragraph_anchor || `p.${ev.page_number || 1}`)}
+                            {formatAnchor(ev.paragraph_anchor || (ev.page_number ? `p.${ev.page_number}` : ''))}
                           </span>
                         </div>
 
@@ -735,20 +916,30 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                           </div>
                         )}
 
-                        {/* 摘录高亮 */}
-                        {ev.excerpt && (
-                          <div
-                            style={{
-                              fontSize: '12px',
-                              padding: '8px 10px',
-                              backgroundColor: '#F0FFF4',
-                              color: '#22543D',
-                              borderRadius: 'var(--radius-sm)',
-                              border: '1px solid #C6F6D5',
-                              lineHeight: 1.5,
-                            }}
-                          >
-                            <span style={{ fontWeight: 600 }}>匹配摘录：</span>「{ev.excerpt}」
+                        {/* 引用摘录列表（采用中性灰白底，不使用误导性成功绿） */}
+                        {ev.usages.filter((u) => u.excerpt && u.excerpt.trim()).length > 0 && (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                            {ev.usages
+                              .filter((u) => u.excerpt && u.excerpt.trim())
+                              .map((u, uIdx) => (
+                                <div
+                                  key={uIdx}
+                                  style={{
+                                    fontSize: '12px',
+                                    padding: '6px 10px',
+                                    backgroundColor: 'var(--bg-secondary)',
+                                    color: 'var(--text-primary)',
+                                    borderRadius: 'var(--radius-sm)',
+                                    border: '1px solid var(--border-color)',
+                                    lineHeight: 1.5,
+                                  }}
+                                >
+                                  <span style={{ fontWeight: 600, color: 'var(--text-secondary)' }}>
+                                    「{u.label}」引用摘录：
+                                  </span>
+                                  <span>{u.excerpt}</span>
+                                </div>
+                              ))}
                           </div>
                         )}
 
@@ -762,6 +953,8 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                             padding: '10px 12px',
                             borderRadius: 'var(--radius-sm)',
                             whiteSpace: 'pre-wrap',
+                            maxHeight: '260px',
+                            overflowY: 'auto',
                           }}
                         >
                           {ev.text_content}
@@ -1151,7 +1344,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                         }}
                       >
                         <Shield size={14} color="var(--brand-accent)" />
-                        <span>独立可理解的核心陈述 *</span>
+                        <span>主要讲什么（核心结论） *</span>
                       </span>
 
                       {!fullEditMode && (
@@ -1270,7 +1463,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                               marginBottom: '6px',
                             }}
                           >
-                            适用责任主体
+                            谁负责（责任主体）
                           </div>
                           {fullEditMode || editingSection === 'subject' ? (
                             <input
@@ -1331,7 +1524,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                                   color: 'var(--text-secondary)',
                                 }}
                               >
-                                适用条件与范围 ({conditions.length})
+                                什么时候适用（前提条件） ({conditions.length})
                               </span>
                               <button
                                 type="button"
@@ -1421,7 +1614,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                                   color: 'var(--text-secondary)',
                                 }}
                               >
-                                规范动作与要求 ({actions.length})
+                                应该怎么做（操作步骤） ({actions.length})
                               </span>
                               <button
                                 type="button"
@@ -1512,7 +1705,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                                 color: 'var(--text-secondary)',
                               }}
                             >
-                              例外、免责情形与禁止条件 ({exceptions.length})
+                              特殊情况与例外（免责或禁止） ({exceptions.length})
                             </span>
                             <button
                               type="button"
@@ -1724,7 +1917,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                                 color: 'var(--text-secondary)',
                               }}
                             >
-                              实施步骤与关键操作 ({actions.length})
+                              应该怎么做（具体步骤） ({actions.length})
                             </span>
                             <button
                               type="button"
@@ -1911,7 +2104,7 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                             color: 'var(--text-secondary)',
                           }}
                         >
-                          核心建议与实战要点
+                          应该怎么做（建议要点）
                         </div>
                         {actions.map((act, idx) => (
                           <div key={idx} style={{ display: 'flex', gap: '6px' }}>
@@ -1997,172 +2190,231 @@ export const ProofreadingModal: React.FC<ProofreadingModalProps> = ({
                           color: 'var(--text-secondary)',
                           display: 'flex',
                           alignItems: 'center',
-                          gap: '4px',
+                          gap: '6px',
                         }}
                       >
                         <Tag size={13} />
                         <span>业务标签与权限管理</span>
                       </span>
+
+                      {!fullEditMode && (
+                        <button
+                          type="button"
+                          onClick={() => setIsTagsEditing(!isTagsEditing)}
+                          className="btn-secondary"
+                          style={{
+                            fontSize: '11px',
+                            height: '26px',
+                            padding: '0 8px',
+                            color: 'var(--text-secondary)',
+                          }}
+                        >
+                          {isTagsEditing ? '完成收拢' : '修改适用范围与权限'}
+                        </button>
+                      )}
                     </div>
 
-                    {/* 标签列表 */}
-                    <div
-                      style={{
-                        display: 'flex',
-                        flexWrap: 'wrap',
-                        gap: '6px',
-                        alignItems: 'center',
-                      }}
-                    >
-                      {customerTypes.map((t) => (
-                        <span
-                          key={`c_${t}`}
-                          style={{
-                            fontSize: '11px',
-                            backgroundColor: 'var(--bg-secondary)',
-                            color: 'var(--text-secondary)',
-                            padding: '2px 8px',
-                            borderRadius: '12px',
-                            border: '1px solid var(--border-color)',
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '4px',
-                          }}
-                        >
-                          客户: {t}
-                          <X
-                            size={11}
-                            cursor="pointer"
-                            onClick={() => {
-                              setCustomerTypes(customerTypes.filter((x) => x !== t));
-                              markDirty();
-                            }}
-                          />
-                        </span>
-                      ))}
-                      {businessScenes.map((t) => (
-                        <span
-                          key={`s_${t}`}
-                          style={{
-                            fontSize: '11px',
-                            backgroundColor: 'var(--bg-secondary)',
-                            color: 'var(--text-secondary)',
-                            padding: '2px 8px',
-                            borderRadius: '12px',
-                            border: '1px solid var(--border-color)',
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '4px',
-                          }}
-                        >
-                          场景: {t}
-                          <X
-                            size={11}
-                            cursor="pointer"
-                            onClick={() => {
-                              setBusinessScenes(businessScenes.filter((x) => x !== t));
-                              markDirty();
-                            }}
-                          />
-                        </span>
-                      ))}
-                      {problemTags.map((t) => (
-                        <span
-                          key={`p_${t}`}
-                          style={{
-                            fontSize: '11px',
-                            backgroundColor: 'var(--bg-secondary)',
-                            color: 'var(--text-secondary)',
-                            padding: '2px 8px',
-                            borderRadius: '12px',
-                            border: '1px solid var(--border-color)',
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '4px',
-                          }}
-                        >
-                          问题: {t}
-                          <X
-                            size={11}
-                            cursor="pointer"
-                            onClick={() => {
-                              setProblemTags(problemTags.filter((x) => x !== t));
-                              markDirty();
-                            }}
-                          />
-                        </span>
-                      ))}
-                    </div>
-
-                    {/* 添加标签输入栏 */}
-                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                      <select
-                        value={tagType}
-                        onChange={(e) => setTagType(e.target.value as any)}
-                        style={{ height: '28px', fontSize: '11px', padding: '0 6px' }}
-                      >
-                        <option value="scene">业务场景</option>
-                        <option value="customer">客户类型</option>
-                        <option value="problem">问题标签</option>
-                      </select>
-                      <input
-                        type="text"
-                        placeholder="输入新标签按回车添加..."
-                        value={tagInput}
-                        onChange={(e) => setTagInput(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') handleAddTag();
-                        }}
+                    {/* 收拢状态下的紧凑概览 */}
+                    {!isTagsEditing && !fullEditMode ? (
+                      <div
                         style={{
-                          flex: 1,
-                          height: '28px',
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(2, 1fr)',
+                          gap: '8px',
                           fontSize: '12px',
-                          padding: '0 8px',
+                          color: 'var(--text-secondary)',
+                          backgroundColor: 'var(--bg-secondary)',
+                          padding: '10px 12px',
                           borderRadius: 'var(--radius-sm)',
-                          border: '1px solid var(--border-color)',
                         }}
-                      />
-                      <button
-                        type="button"
-                        className="btn-secondary"
-                        onClick={handleAddTag}
-                        style={{ height: '28px', fontSize: '11px', padding: '0 10px' }}
                       >
-                        添加
-                      </button>
-                    </div>
+                        <div>
+                          <span style={{ color: 'var(--text-muted)' }}>适用客户：</span>
+                          <strong style={{ color: 'var(--text-primary)', fontWeight: 500 }}>
+                            {customerTypes.length > 0 ? customerTypes.join('、') : '通用客户'}
+                          </strong>
+                        </div>
+                        <div>
+                          <span style={{ color: 'var(--text-muted)' }}>业务场景：</span>
+                          <strong style={{ color: 'var(--text-primary)', fontWeight: 500 }}>
+                            {businessScenes.length > 0 ? businessScenes.join('、') : '通用场景'}
+                          </strong>
+                        </div>
+                        <div>
+                          <span style={{ color: 'var(--text-muted)' }}>问题标签：</span>
+                          <strong style={{ color: 'var(--text-primary)', fontWeight: 500 }}>
+                            {problemTags.length > 0 ? problemTags.join('、') : '未标记'}
+                          </strong>
+                        </div>
+                        <div>
+                          <span style={{ color: 'var(--text-muted)' }}>可见权限：</span>
+                          <strong style={{ color: 'var(--text-primary)', fontWeight: 500 }}>
+                            {accessScope === 'org_internal' ? '企业全员可用' : '仅管理员可见'}
+                          </strong>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        {/* 标签列表 */}
+                        <div
+                          style={{
+                            display: 'flex',
+                            flexWrap: 'wrap',
+                            gap: '6px',
+                            alignItems: 'center',
+                          }}
+                        >
+                          {customerTypes.map((t) => (
+                            <span
+                              key={`c_${t}`}
+                              style={{
+                                fontSize: '11px',
+                                backgroundColor: 'var(--bg-secondary)',
+                                color: 'var(--text-secondary)',
+                                padding: '2px 8px',
+                                borderRadius: '12px',
+                                border: '1px solid var(--border-color)',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '4px',
+                              }}
+                            >
+                              客户: {t}
+                              <X
+                                size={11}
+                                cursor="pointer"
+                                onClick={() => {
+                                  setCustomerTypes(customerTypes.filter((x) => x !== t));
+                                  markDirty();
+                                }}
+                              />
+                            </span>
+                          ))}
+                          {businessScenes.map((t) => (
+                            <span
+                              key={`s_${t}`}
+                              style={{
+                                fontSize: '11px',
+                                backgroundColor: 'var(--bg-secondary)',
+                                color: 'var(--text-secondary)',
+                                padding: '2px 8px',
+                                borderRadius: '12px',
+                                border: '1px solid var(--border-color)',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '4px',
+                              }}
+                            >
+                              场景: {t}
+                              <X
+                                size={11}
+                                cursor="pointer"
+                                onClick={() => {
+                                  setBusinessScenes(businessScenes.filter((x) => x !== t));
+                                  markDirty();
+                                }}
+                              />
+                            </span>
+                          ))}
+                          {problemTags.map((t) => (
+                            <span
+                              key={`p_${t}`}
+                              style={{
+                                fontSize: '11px',
+                                backgroundColor: 'var(--bg-secondary)',
+                                color: 'var(--text-secondary)',
+                                padding: '2px 8px',
+                                borderRadius: '12px',
+                                border: '1px solid var(--border-color)',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '4px',
+                              }}
+                            >
+                              问题: {t}
+                              <X
+                                size={11}
+                                cursor="pointer"
+                                onClick={() => {
+                                  setProblemTags(problemTags.filter((x) => x !== t));
+                                  markDirty();
+                                }}
+                              />
+                            </span>
+                          ))}
+                        </div>
 
-                    {/* 权限选择 */}
-                    <div
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'space-between',
-                        paddingTop: '8px',
-                        borderTop: '1px solid var(--bg-secondary)',
-                      }}
-                    >
-                      <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                        访问权限控制
-                      </span>
-                      <select
-                        value={accessScope}
-                        onChange={(e) => {
-                          setAccessScope(e.target.value as any);
-                          markDirty();
-                        }}
-                        style={{
-                          height: '28px',
-                          fontSize: '11px',
-                          padding: '0 8px',
-                          borderRadius: 'var(--radius-sm)',
-                          border: '1px solid var(--border-color)',
-                        }}
-                      >
-                        <option value="admin_only">仅管理员可见</option>
-                        <option value="org_internal">企业内部全员可用</option>
-                      </select>
-                    </div>
+                        {/* 添加标签输入栏 */}
+                        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                          <select
+                            value={tagType}
+                            onChange={(e) => setTagType(e.target.value as any)}
+                            style={{ height: '28px', fontSize: '11px', padding: '0 6px' }}
+                          >
+                            <option value="scene">业务场景</option>
+                            <option value="customer">客户类型</option>
+                            <option value="problem">问题标签</option>
+                          </select>
+                          <input
+                            type="text"
+                            placeholder="输入新标签按回车添加..."
+                            value={tagInput}
+                            onChange={(e) => setTagInput(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleAddTag();
+                            }}
+                            style={{
+                              flex: 1,
+                              height: '28px',
+                              fontSize: '12px',
+                              padding: '0 8px',
+                              borderRadius: 'var(--radius-sm)',
+                              border: '1px solid var(--border-color)',
+                            }}
+                          />
+                          <button
+                            type="button"
+                            className="btn-secondary"
+                            onClick={handleAddTag}
+                            style={{ height: '28px', fontSize: '11px', padding: '0 10px' }}
+                          >
+                            添加
+                          </button>
+                        </div>
+
+                        {/* 权限选择 */}
+                        <div
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            paddingTop: '8px',
+                            borderTop: '1px solid var(--bg-secondary)',
+                          }}
+                        >
+                          <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                            访问权限控制
+                          </span>
+                          <select
+                            value={accessScope}
+                            onChange={(e) => {
+                              setAccessScope(e.target.value as any);
+                              markDirty();
+                            }}
+                            style={{
+                              height: '28px',
+                              fontSize: '11px',
+                              padding: '0 8px',
+                              borderRadius: 'var(--radius-sm)',
+                              border: '1px solid var(--border-color)',
+                            }}
+                          >
+                            <option value="admin_only">仅管理员可见</option>
+                            <option value="org_internal">企业内部全员可用</option>
+                          </select>
+                        </div>
+                      </>
+                    )}
                   </div>
                 </div>
 

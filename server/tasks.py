@@ -456,6 +456,140 @@ def execute_extract_task(task_id: str):
             )
 
 
+def build_index_for_version(conn, version_id: str, org_id: str) -> str:
+    """
+    为指定知识版本构建检索索引记录（retrieval_records）并置 index_status 为 ready。
+    组合标题、陈述、主体、条件、动作、例外、指标与业务标签生成综合检索文本。
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    row = conn.execute(
+        """
+        SELECT kv.*, d.title as doc_title
+        FROM knowledge_versions kv
+        JOIN knowledge_items ki ON kv.item_id = ki.id
+        JOIN documents d ON ki.document_id = d.id
+        WHERE kv.id = ? AND kv.organization_id = ? AND ki.lifecycle_status != 'deleted' AND d.is_deleted = 0
+        """,
+        (version_id, org_id)
+    ).fetchone()
+
+    if not row:
+        raise ValueError(f"知识版本 {version_id} 不存在或对应资料已被删除")
+
+    parts = []
+    if row["title"]:
+        parts.append(f"【标题】{row['title']}")
+    if row["primary_category"]:
+        parts.append(f"【分类】{row['primary_category']}")
+    if row["subject"]:
+        parts.append(f"【责任主体】{row['subject']}")
+    if row["statement"]:
+        parts.append(f"【核心结论】{row['statement']}")
+    if row["content"] and row["content"] != row["statement"]:
+        parts.append(f"【正文详情】{row['content']}")
+
+    conditions = json.loads(row["conditions_json"] or "[]")
+    if conditions:
+        parts.append(f"【适用条件】{'；'.join(conditions)}")
+
+    actions = json.loads(row["actions_json"] or "[]")
+    if actions:
+        parts.append(f"【执行动作】{'；'.join(actions)}")
+
+    exceptions = json.loads(row["exceptions_json"] or "[]")
+    if exceptions:
+        parts.append(f"【例外与禁止】{'；'.join(exceptions)}")
+
+    if row["metric_definition_json"]:
+        m = json.loads(row["metric_definition_json"])
+        parts.append(f"【指标要求】名称:{m.get('name', '')} 单位:{m.get('unit', '')} 统计期:{m.get('period', '')} 基准:{m.get('criteria', '')}")
+
+    if row["case_details_json"]:
+        c = json.loads(row["case_details_json"])
+        parts.append(f"【案例实战】背景:{c.get('background', '')} 动作:{c.get('actions', '')} 效果:{c.get('results', '')}")
+
+    customer_types = json.loads(row["customer_types_json"] or "[]")
+    if customer_types:
+        parts.append(f"【客户类型】{' '.join(customer_types)}")
+
+    business_scenes = json.loads(row["business_scenes_json"] or "[]")
+    if business_scenes:
+        parts.append(f"【业务场景】{' '.join(business_scenes)}")
+
+    problem_tags = json.loads(row["problem_tags_json"] or "[]")
+    if problem_tags:
+        parts.append(f"【解决问题】{' '.join(problem_tags)}")
+
+    if row["doc_title"]:
+        parts.append(f"【来源资料】{row['doc_title']}")
+
+    search_text = "\n".join(parts)
+
+    # 清除历史旧索引
+    conn.execute("DELETE FROM retrieval_records WHERE knowledge_version_id = ?", (version_id,))
+
+    record_id = f"ret_{uuid.uuid4().hex[:12]}"
+    conn.execute(
+        """
+        INSERT INTO retrieval_records 
+        (id, knowledge_version_id, organization_id, search_text, vector_json, model_name, index_version, created_at)
+        VALUES (?, ?, ?, ?, NULL, 'keyword-v1', 1, ?)
+        """,
+        (record_id, version_id, org_id, search_text, now_iso)
+    )
+
+    conn.execute(
+        "UPDATE knowledge_versions SET index_status = 'ready' WHERE id = ?",
+        (version_id,)
+    )
+
+    return record_id
+
+
+def execute_build_index_task(task_id: str):
+    """
+    持久化索引构建执行流：
+    将知识条目版本解析并写入 retrieval_records，置 index_status 为 ready。
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        task = conn.execute(
+            "SELECT id, organization_id, target_id, status FROM processing_tasks WHERE id = ?",
+            (task_id,)
+        ).fetchone()
+        if not task or task["status"] == "cancelled":
+            return
+
+        conn.execute(
+            "UPDATE processing_tasks SET status = 'running', started_at = ? WHERE id = ?",
+            (now_iso, task_id)
+        )
+        version_id = task["target_id"]
+        org_id = task["organization_id"]
+        conn.execute("UPDATE knowledge_versions SET index_status = 'indexing' WHERE id = ?", (version_id,))
+
+    try:
+        with get_db() as conn:
+            build_index_for_version(conn, version_id, org_id)
+            conn.execute(
+                "UPDATE processing_tasks SET status = 'completed', completed_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), task_id)
+            )
+        logger.info(f"Build index task {task_id} completed for version {version_id}.")
+    except Exception as e:
+        logger.error(f"Build index task {task_id} failed: {e}", exc_info=True)
+        err_msg = str(e)
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE processing_tasks SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?",
+                (err_msg, datetime.now(timezone.utc).isoformat(), task_id)
+            )
+            conn.execute(
+                "UPDATE knowledge_versions SET index_status = 'failed' WHERE id = ?",
+                (version_id,)
+            )
+
+
 def submit_task(task_id: str):
     """
     根据任务类型智能分发到后台工作线程
@@ -471,6 +605,8 @@ def submit_task(task_id: str):
             _executor.submit(execute_parse_task, task_id)
         elif t_type == "extract_atoms":
             _executor.submit(execute_extract_task, task_id)
+        elif t_type == "build_index":
+            _executor.submit(execute_build_index_task, task_id)
         else:
             logger.info(f"Task type {t_type} handler pending next stage.")
 

@@ -140,6 +140,8 @@ export interface KnowledgeItem {
   extraction_context: Record<string, any>;
   related_cases: string[];
   evidence_count: number;
+  has_draft_version?: boolean;
+  draft_version_number?: number | null;
 }
 
 export interface KnowledgeItemDetail {
@@ -152,6 +154,8 @@ export interface KnowledgeItemDetail {
   lifecycle_status: string;
   created_at: string;
   updated_at: string;
+  is_draft_version?: boolean;
+  serving_version_number?: number | null;
   active_version: KnowledgeItem;
   evidence: KnowledgeEvidence[];
   version_history: Array<{
@@ -172,11 +176,42 @@ export interface KnowledgeStats {
   unclassified_count: number;
   pending_review_count: number;
   confirmed_count: number;
+  active_count?: number;
+  disabled_count?: number;
 }
 
 export interface KnowledgeItemsResponse {
   items: KnowledgeItem[];
   stats: KnowledgeStats;
+}
+
+export interface SearchKnowledgeResultItem {
+  item_id: string;
+  version_id: string;
+  version_number: number;
+  title: string;
+  primary_category: PrimaryCategory;
+  atom_type: AtomType;
+  subject: string;
+  statement: string;
+  content: string;
+  document_id: string;
+  document_title: string;
+  document_version_label: string;
+  customer_types: string[];
+  business_scenes: string[];
+  problem_tags: string[];
+  access_scope: 'admin_only' | 'org_internal';
+  lifecycle_status: 'active' | 'disabled';
+  evidence_count: number;
+  matched_snippets: string[];
+  score: number;
+}
+
+export interface SearchKnowledgeResponse {
+  query: string;
+  total: number;
+  items: SearchKnowledgeResultItem[];
 }
 
 export interface UploadResult {

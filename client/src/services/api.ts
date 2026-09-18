@@ -7,6 +7,7 @@ import {
   UploadResult,
   KnowledgeItemsResponse,
   KnowledgeItemDetail,
+  SearchKnowledgeResponse,
 } from '../types';
 
 const API_BASE_URL = 'http://127.0.0.1:8766/api';
@@ -182,12 +183,14 @@ export const api = {
     document_id?: string;
     category?: string;
     review_status?: string;
+    lifecycle_status?: string;
     search?: string;
   }): Promise<KnowledgeItemsResponse> {
     const query = new URLSearchParams();
     if (params?.document_id) query.append('document_id', params.document_id);
     if (params?.category) query.append('category', params.category);
     if (params?.review_status) query.append('review_status', params.review_status);
+    if (params?.lifecycle_status) query.append('lifecycle_status', params.lifecycle_status);
     if (params?.search) query.append('search', params.search);
     const qs = query.toString() ? `?${query.toString()}` : '';
     return request<KnowledgeItemsResponse>(`/knowledge/items${qs}`);
@@ -200,8 +203,8 @@ export const api = {
   async saveKnowledgeDraft(
     itemId: string,
     payload: Record<string, any>
-  ): Promise<{ message: string; revision_token: string; quality_flags: string[] }> {
-    return request<{ message: string; revision_token: string; quality_flags: string[] }>(
+  ): Promise<{ message: string; revision_token: string; quality_flags: string[]; is_new_version_draft?: boolean }> {
+    return request<{ message: string; revision_token: string; quality_flags: string[]; is_new_version_draft?: boolean }>(
       `/knowledge/items/${itemId}/draft`,
       {
         method: 'PUT',
@@ -221,6 +224,37 @@ export const api = {
         body: JSON.stringify(payload),
       }
     );
+  },
+
+  async updateKnowledgeLifecycle(
+    itemId: string,
+    lifecycleStatus: 'active' | 'disabled'
+  ): Promise<{ message: string; item_id: string; lifecycle_status: string }> {
+    return request<{ message: string; item_id: string; lifecycle_status: string }>(
+      `/knowledge/items/${itemId}/lifecycle`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ lifecycle_status: lifecycleStatus }),
+      }
+    );
+  },
+
+  async searchKnowledge(params: {
+    q: string;
+    document_id?: string;
+    category?: string;
+    customer_type?: string;
+    business_scene?: string;
+    problem_tag?: string;
+  }): Promise<SearchKnowledgeResponse> {
+    const query = new URLSearchParams();
+    query.append('q', params.q);
+    if (params.document_id) query.append('document_id', params.document_id);
+    if (params.category) query.append('category', params.category);
+    if (params.customer_type) query.append('customer_type', params.customer_type);
+    if (params.business_scene) query.append('business_scene', params.business_scene);
+    if (params.problem_tag) query.append('problem_tag', params.problem_tag);
+    return request<SearchKnowledgeResponse>(`/knowledge/search?${query.toString()}`);
   },
 
   async deleteKnowledgeItem(

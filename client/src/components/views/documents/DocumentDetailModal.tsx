@@ -365,10 +365,20 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                   color: 'var(--text-secondary)',
                 }}
               >
-                <span>忠实反映原始上传文件的结构、段落与锚点定位，供核对时溯源参考。</span>
-                <span style={{ color: 'var(--brand-accent)', fontWeight: 500 }}>
-                  共 {blocks.length} 处正文段落与表格
-                </span>
+                <span>忠实反映原始上传文件的内容与段落结构，供核对时溯源参考。</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => setShowRawBlocks(!showRawBlocks)}
+                    style={{ height: '26px', fontSize: '11px', padding: '0 10px' }}
+                  >
+                    {showRawBlocks ? '切换文章阅读视图' : '查看结构信息'}
+                  </button>
+                  <span style={{ color: 'var(--brand-accent)', fontWeight: 500 }}>
+                    共 {blocks.length} 处正文段落与表格
+                  </span>
+                </div>
               </div>
 
               {blocksLoading ? (
@@ -390,7 +400,81 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                     ? '正文解析进行中，请稍候...'
                     : '未提取到正文文本，若为扫描件暂不支持文字层识别'}
                 </div>
+              ) : !showRawBlocks ? (
+                /* 默认整洁文章排版 */
+                <div
+                  style={{
+                    border: '1px solid var(--border-color)',
+                    borderRadius: 'var(--radius-md)',
+                    backgroundColor: '#FFFFFF',
+                    padding: '28px 36px',
+                    maxWidth: '840px',
+                    margin: '0 auto',
+                    width: '100%',
+                    lineHeight: 1.8,
+                    fontSize: '14px',
+                    color: 'var(--text-primary)',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.02)',
+                  }}
+                >
+                  {blocks.map((block) => {
+                    if (block.block_type === 'heading') {
+                      return (
+                        <h3
+                          key={block.id}
+                          id={`anchor-${block.paragraph_anchor}`}
+                          style={{
+                            fontSize: '16px',
+                            fontWeight: 700,
+                            color: 'var(--text-primary)',
+                            marginTop: '22px',
+                            marginBottom: '10px',
+                            paddingBottom: '6px',
+                            borderBottom: '1px solid var(--border-color)',
+                          }}
+                        >
+                          {block.text_content}
+                        </h3>
+                      );
+                    }
+                    if (block.block_type === 'table') {
+                      return (
+                        <div
+                          key={block.id}
+                          id={`anchor-${block.paragraph_anchor}`}
+                          style={{
+                            backgroundColor: 'var(--bg-secondary)',
+                            border: '1px solid var(--border-color)',
+                            borderRadius: 'var(--radius-sm)',
+                            padding: '12px',
+                            margin: '14px 0',
+                            overflowX: 'auto',
+                            fontFamily: 'monospace',
+                            fontSize: '12px',
+                            whiteSpace: 'pre',
+                          }}
+                        >
+                          {block.text_content}
+                        </div>
+                      );
+                    }
+                    return (
+                      <p
+                        key={block.id}
+                        id={`anchor-${block.paragraph_anchor}`}
+                        style={{
+                          margin: '0 0 14px 0',
+                          lineHeight: 1.8,
+                          whiteSpace: 'pre-wrap',
+                        }}
+                      >
+                        {block.text_content}
+                      </p>
+                    );
+                  })}
+                </div>
               ) : (
+                /* 结构块拆解视图 */
                 <div
                   style={{
                     border: '1px solid var(--border-color)',
@@ -410,7 +494,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                         padding: '10px 14px',
                         borderRadius: 'var(--radius-sm)',
                         backgroundColor: block.block_type === 'heading' ? 'var(--bg-secondary)' : '#FFFFFF',
-                        borderLeft: block.block_type === 'heading' ? '3px solid var(--brand-accent)' : '1px solid transparent',
+                        borderLeft: block.block_type === 'heading' ? '3px solid var(--brand-accent)' : '1px solid var(--border-color)',
                         display: 'flex',
                         flexDirection: 'column',
                         gap: '6px',
@@ -421,7 +505,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                         <span style={{ fontWeight: 500, color: 'var(--text-secondary)' }}>
                           {block.heading_path || '正文'}
                         </span>
-                        <span style={{ backgroundColor: 'var(--bg-secondary)', padding: '1px 6px', borderRadius: '4px' }}>
+                        <span style={{ backgroundColor: 'var(--bg-secondary)', padding: '1px 6px', borderRadius: '4px', border: '1px solid var(--border-color)' }}>
                           {formatAnchor(block.paragraph_anchor || `p.${block.page_number || 1}`)}
                         </span>
                       </div>
