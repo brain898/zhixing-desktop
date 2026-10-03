@@ -1,13 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from './context/AuthContext';
-import { WindowHeader } from './components/layout/WindowHeader';
 import { GlobalSidebar } from './components/layout/GlobalSidebar';
 import { LoginView } from './components/views/LoginView';
 import { KnowledgeWorkspaceView } from './components/views/KnowledgeWorkspaceView';
 import { MemberHomeView } from './components/views/MemberHomeView';
 import { UnauthorizedView } from './components/views/UnauthorizedView';
 import { NavItemKey } from './types';
-import { Wrench, Bot } from 'lucide-react';
+import { SkillFactoryView } from './components/views/skills/SkillFactoryView';
+import { ConsultView } from './components/views/consult/ConsultView';
+import { LogoMark } from './components/common/Logo';
 
 export const AppContent: React.FC = () => {
   const { user, isLoading } = useAuth();
@@ -26,16 +27,10 @@ export const AppContent: React.FC = () => {
 
   if (isLoading) {
     return (
-      <div
-        style={{
-          height: '100%',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          color: 'var(--text-secondary)',
-          backgroundColor: 'var(--bg-primary)',
-        }}
-      >
+      <div className="zx-boot">
+        <span className="zx-boot-mark">
+          <LogoMark size={48} />
+        </span>
         知行有策 桌面工作台启动中...
       </div>
     );
@@ -45,7 +40,6 @@ export const AppContent: React.FC = () => {
   if (!user) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-        <WindowHeader />
         <LoginView />
       </div>
     );
@@ -62,82 +56,12 @@ export const AppContent: React.FC = () => {
       case 'knowledge':
         return <KnowledgeWorkspaceView />;
       case 'skills':
-        return (
-          <div
-            style={{
-              flex: 1,
-              height: '100%',
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              justifyContent: 'center',
-              color: 'var(--text-secondary)',
-              backgroundColor: 'var(--bg-primary)',
-              gap: '12px',
-            }}
-          >
-            <div
-              style={{
-                width: '44px',
-                height: '44px',
-                borderRadius: '50%',
-                backgroundColor: 'var(--bg-secondary)',
-                color: 'var(--text-primary)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-              }}
-            >
-              <Wrench size={22} />
-            </div>
-            <h3 style={{ fontSize: '16px', fontWeight: 600, color: 'var(--text-primary)' }}>
-              Skill 工厂模块（准备中）
-            </h3>
-            <p style={{ fontSize: '13px', color: 'var(--text-secondary)', maxWidth: '420px', textAlign: 'center' }}>
-              遵循产品契约：Skill 生产依赖已确认并索引完成的知识原子。当前阶段集中跑通知识资产整理。
-            </p>
-          </div>
-        );
+        return <SkillFactoryView />;
       case 'agent':
         if (user.role === 'member') {
           return <MemberHomeView />;
         }
-        return (
-          <div
-            style={{
-              flex: 1,
-              height: '100%',
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              justifyContent: 'center',
-              color: 'var(--text-secondary)',
-              backgroundColor: 'var(--bg-primary)',
-              gap: '12px',
-            }}
-          >
-            <div
-              style={{
-                width: '44px',
-                height: '44px',
-                borderRadius: '50%',
-                backgroundColor: 'var(--bg-secondary)',
-                color: 'var(--brand-accent)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-              }}
-            >
-              <Bot size={22} />
-            </div>
-            <h3 style={{ fontSize: '16px', fontWeight: 600, color: 'var(--text-primary)' }}>
-              Agent 咨询管理（准备中）
-            </h3>
-            <p style={{ fontSize: '13px', color: 'var(--text-secondary)', maxWidth: '420px', textAlign: 'center' }}>
-              管理员视角：用于配置向普通成员或客户开放的受控知识咨询边界与审计。
-            </p>
-          </div>
-        );
+        return <ConsultView />;
       default:
         return null;
     }
@@ -145,10 +69,9 @@ export const AppContent: React.FC = () => {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-      <WindowHeader />
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
         <GlobalSidebar currentNav={currentNav} onSelectNav={setCurrentNav} />
-        <main style={{ flex: 1, minWidth: 0, height: '100%', overflow: 'hidden' }}>
+        <main style={{ flex: 1, minWidth: 0, height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column', backgroundColor: 'var(--bg-secondary)' }}>
           {renderContent()}
         </main>
       </div>

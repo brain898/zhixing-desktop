@@ -9,10 +9,9 @@ import {
   Clock,
   ChevronDown,
   ChevronRight,
-  Layers,
-  Sparkles,
+  Trash2,
 } from 'lucide-react';
-import { DocumentDetail, DocumentVersion, SourceBlock } from '../../../types';
+import { DocumentDetail, DocumentVersion, SourceBlock, SourceLocator } from '../../../types';
 import { api } from '../../../services/api';
 import { formatVersionLabel, formatAnchor, formatFileType } from '../../../utils/formatters';
 
@@ -20,16 +19,22 @@ interface DocumentDetailModalProps {
   documentId: string | null;
   isOpen: boolean;
   defaultTab?: 'preview' | 'pipeline';
+  initialVersionId?: string | null;
+  focusLocator?: SourceLocator | null;
   onClose: () => void;
   onRefreshList: () => void;
+  onDeleteRequested: (document: DocumentDetail) => void;
 }
 
 export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
   documentId,
   isOpen,
   defaultTab = 'preview',
+  initialVersionId = null,
+  focusLocator = null,
   onClose,
   onRefreshList,
+  onDeleteRequested,
 }) => {
   const [activeTab, setActiveTab] = useState<'preview' | 'pipeline'>(defaultTab);
   const [docDetail, setDocDetail] = useState<DocumentDetail | null>(null);
@@ -54,10 +59,13 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
       const data = await api.getDocument(documentId);
       setDocDetail(data);
 
-      const targetVerId =
-        preserveVersion && selectedVersionId && data.versions.some((v: DocumentVersion) => v.id === selectedVersionId)
-          ? selectedVersionId
-          : data.active_version_id || (data.versions[0] ? data.versions[0].id : null);
+      const hasInitialVersion =
+        initialVersionId && data.versions.some((v: DocumentVersion) => v.id === initialVersionId);
+      const targetVerId = hasInitialVersion
+        ? initialVersionId
+        : preserveVersion && selectedVersionId && data.versions.some((v: DocumentVersion) => v.id === selectedVersionId)
+        ? selectedVersionId
+        : data.active_version_id || (data.versions[0] ? data.versions[0].id : null);
 
       setSelectedVersionId(targetVerId);
     } catch (err: any) {
@@ -72,31 +80,56 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
     setLoading(true);
     setError(null);
     fetchDetail(false);
-  }, [isOpen, documentId]);
+  }, [isOpen, documentId, initialVersionId]);
 
-  // 当处于正在解析或提取中时轮询状态
+  // 当处于正在解析或提取中时轮询状态（避免重叠轮询与无变化的重复全量刷新）
+  const isFetchingDetailRef = React.useRef(false);
+  const currentVerStatus = docDetail?.versions.find((v) => v.id === selectedVersionId)?.processing_status;
+  const prevVerStatusRef = React.useRef(currentVerStatus);
+
+  useEffect(() => {
+    prevVerStatusRef.current = currentVerStatus;
+  }, [currentVerStatus]);
+
   useEffect(() => {
     if (!isOpen || !selectedVersionId || !documentId) return;
 
-    let timer: NodeJS.Timeout | null = null;
-    const currentVer = docDetail?.versions.find((v) => v.id === selectedVersionId);
+    const isActive =
+      currentVerStatus === 'parsing' ||
+      currentVerStatus === 'queued' ||
+      currentVerStatus === 'extracting';
 
-    if (
-      currentVer &&
-      (currentVer.processing_status === 'parsing' ||
-        currentVer.processing_status === 'queued' ||
-        currentVer.processing_status === 'extracting')
-    ) {
-      timer = setInterval(() => {
-        fetchDetail(true);
-        onRefreshList();
-      }, 2500);
-    }
+    if (!isActive) return;
+
+    let isSubscribed = true;
+    const timer = setInterval(async () => {
+      if (isFetchingDetailRef.current) return;
+      isFetchingDetailRef.current = true;
+      try {
+        const data = await api.getDocument(documentId);
+        if (isSubscribed) {
+          setDocDetail(data);
+          const updatedVer = data.versions.find((v: DocumentVersion) => v.id === selectedVersionId);
+          const newStatus = updatedVer?.processing_status;
+
+          // 仅在状态产生真实变化或任务结束时，才通知主页面刷新列表与统计
+          if (newStatus && newStatus !== prevVerStatusRef.current) {
+            prevVerStatusRef.current = newStatus;
+            onRefreshList();
+          }
+        }
+      } catch (err: any) {
+        console.error('Failed to poll document detail:', err);
+      } finally {
+        isFetchingDetailRef.current = false;
+      }
+    }, 2500);
 
     return () => {
-      if (timer) clearInterval(timer);
+      isSubscribed = false;
+      clearInterval(timer);
     };
-  }, [isOpen, selectedVersionId, docDetail]);
+  }, [isOpen, selectedVersionId, documentId, currentVerStatus, onRefreshList]);
 
   // 支持 Escape 键关闭抽屉
   useEffect(() => {
@@ -122,7 +155,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
       try {
         setBlocksLoading(true);
         const data = await api.getSourceBlocks(documentId, selectedVersionId);
-        setBlocks(data);
+        setBlocks(Array.isArray(data) ? data : []);
       } catch (err: any) {
         console.error('Failed to load blocks:', err);
       } finally {
@@ -132,6 +165,38 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
 
     loadBlocks();
   }, [isOpen, documentId, selectedVersionId, docDetail]);
+
+  // 正式检索来源定位：在指定历史文件版本中定位真实页码/标题/段落/行锚点。
+  useEffect(() => {
+    if (!isOpen || activeTab !== 'preview' || blocksLoading || blocks.length === 0 || !focusLocator) return;
+
+    const target = blocks.find((block) => {
+      if (focusLocator.paragraph_anchor && block.paragraph_anchor === focusLocator.paragraph_anchor) return true;
+      if (focusLocator.block_index !== null && block.block_index === focusLocator.block_index) return true;
+      if (
+        focusLocator.page_number !== null &&
+        block.page_number === focusLocator.page_number &&
+        (!focusLocator.heading_path || block.heading_path === focusLocator.heading_path)
+      ) return true;
+      return false;
+    });
+    if (!target) return;
+
+    const timer = window.setTimeout(() => {
+      const element = document.querySelector(`[data-source-block-id="${target.id}"]`) as HTMLElement | null;
+      if (!element) return;
+      element.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      element.animate(
+        [
+          { backgroundColor: 'rgba(40, 92, 73, 0.16)' },
+          { backgroundColor: 'rgba(40, 92, 73, 0)' },
+        ],
+        { duration: 1800, easing: 'ease-out' }
+      );
+    }, 80);
+
+    return () => window.clearTimeout(timer);
+  }, [isOpen, activeTab, blocksLoading, blocks, focusLocator]);
 
   if (!isOpen || !documentId) return null;
 
@@ -191,7 +256,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
         left: 0,
         right: 0,
         bottom: 0,
-        backgroundColor: 'rgba(0, 0, 0, 0.45)',
+        backgroundColor: 'rgba(18, 26, 22, 0.42)',
         zIndex: 1000,
         display: 'flex',
         alignItems: 'center',
@@ -201,12 +266,12 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
     >
       <div
         style={{
-          width: '920px',
-          height: '85vh',
+          width: '1080px',
+          height: '86vh',
           maxWidth: '95vw',
-          backgroundColor: '#FFFFFF',
+          backgroundColor: 'var(--bg-primary)',
           borderRadius: 'var(--radius-lg)',
-          boxShadow: '0 16px 48px rgba(0, 0, 0, 0.22)',
+          boxShadow: 'var(--shadow-lg)',
           display: 'flex',
           flexDirection: 'column',
           overflow: 'hidden',
@@ -216,21 +281,23 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
         {/* 顶部标题栏与 Tab */}
         <div
           style={{
-            padding: '16px 24px',
+            padding: '12px 20px 12px 24px',
+            minHeight: '64px',
+            gap: '16px',
             borderBottom: '1px solid var(--border-color)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            backgroundColor: 'var(--bg-secondary)',
+            backgroundColor: 'var(--bg-primary)',
             flexShrink: 0,
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '16px', minWidth: 0, flex: 1 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: 0, flex: 1 }}>
             <div
               style={{
                 width: '36px',
                 height: '36px',
-                borderRadius: 'var(--radius-sm)',
+                borderRadius: 'var(--radius-md)',
                 backgroundColor: 'var(--brand-accent-light)',
                 color: 'var(--brand-accent)',
                 display: 'flex',
@@ -244,7 +311,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
             <div style={{ minWidth: 0, flex: 1 }}>
               <div
                 style={{
-                  fontSize: '15px',
+                  fontSize: 'var(--font-size-section)',
                   fontWeight: 600,
                   color: 'var(--text-primary)',
                   whiteSpace: 'nowrap',
@@ -254,7 +321,17 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
               >
                 {docDetail?.title || '资料详情'}
               </div>
-              <div style={{ fontSize: '11px', color: 'var(--text-secondary)', marginTop: '2px', display: 'flex', gap: '12px' }}>
+              <div
+                style={{
+                  fontSize: 'var(--font-size-xs)',
+                  color: 'var(--text-muted)',
+                  marginTop: '2px',
+                  display: 'flex',
+                  gap: '4px 14px',
+                  flexWrap: 'wrap',
+                  whiteSpace: 'nowrap',
+                }}
+              >
                 <span>版本：{formatVersionLabel(currentVersion?.version_label)}</span>
                 <span>格式：{formatFileType(currentVersion?.file_type)}</span>
                 <span>大小：{formatSize(currentVersion?.file_size || 0)}</span>
@@ -264,46 +341,19 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
           </div>
 
           {/* 切换 Tab：原文预览 VS 处理详情 */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexShrink: 0 }}>
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                backgroundColor: '#FFFFFF',
-                padding: '2px',
-                borderRadius: 'var(--radius-sm)',
-                border: '1px solid var(--border-color)',
-              }}
-            >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
+            <div className="zx-segmented" style={{ marginRight: '6px' }}>
               <button
                 type="button"
                 onClick={() => setActiveTab('preview')}
-                style={{
-                  padding: '5px 14px',
-                  fontSize: '12px',
-                  fontWeight: activeTab === 'preview' ? 600 : 400,
-                  border: 'none',
-                  borderRadius: 'var(--radius-xs)',
-                  backgroundColor: activeTab === 'preview' ? 'var(--brand-accent-light)' : 'transparent',
-                  color: activeTab === 'preview' ? 'var(--brand-accent)' : 'var(--text-secondary)',
-                  cursor: 'pointer',
-                }}
+                className={activeTab === 'preview' ? 'active' : undefined}
               >
                 原文预览
               </button>
               <button
                 type="button"
                 onClick={() => setActiveTab('pipeline')}
-                style={{
-                  padding: '5px 14px',
-                  fontSize: '12px',
-                  fontWeight: activeTab === 'pipeline' ? 600 : 400,
-                  border: 'none',
-                  borderRadius: 'var(--radius-xs)',
-                  backgroundColor: activeTab === 'pipeline' ? 'var(--brand-accent-light)' : 'transparent',
-                  color: activeTab === 'pipeline' ? 'var(--brand-accent)' : 'var(--text-secondary)',
-                  cursor: 'pointer',
-                }}
+                className={activeTab === 'pipeline' ? 'active' : undefined}
               >
                 处理详情
               </button>
@@ -311,14 +361,28 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
 
             <button
               type="button"
-              className="btn-secondary"
+              className="btn-ghost"
               onClick={handleDownload}
               disabled={downloading || !currentVersion}
-              style={{ height: '30px', fontSize: '12px', gap: '4px' }}
               title="下载保存到本地的文件原件"
             >
               <Download size={13} />
               <span>{downloading ? '下载中' : '下载原件'}</span>
+            </button>
+
+            <button
+              type="button"
+              data-testid="delete-doc-btn"
+              onClick={() => {
+                if (!docDetail) return;
+                onDeleteRequested(docDetail);
+                onClose();
+              }}
+              className="btn-danger-ghost"
+              disabled={!docDetail}
+            >
+              <Trash2 size={13} />
+              <span>删除资料</span>
             </button>
 
             <button
@@ -361,7 +425,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                   padding: '10px 14px',
                   backgroundColor: 'var(--bg-secondary)',
                   borderRadius: 'var(--radius-sm)',
-                  fontSize: '12px',
+                  fontSize: 'var(--font-size-xs)',
                   color: 'var(--text-secondary)',
                 }}
               >
@@ -371,7 +435,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                     type="button"
                     className="btn-secondary"
                     onClick={() => setShowRawBlocks(!showRawBlocks)}
-                    style={{ height: '26px', fontSize: '11px', padding: '0 10px' }}
+                    style={{ height: '26px', fontSize: 'var(--font-size-xs)', padding: '0 10px' }}
                   >
                     {showRawBlocks ? '切换文章阅读视图' : '查看结构信息'}
                   </button>
@@ -414,7 +478,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                     lineHeight: 1.8,
                     fontSize: '14px',
                     color: 'var(--text-primary)',
-                    boxShadow: '0 1px 3px rgba(0,0,0,0.02)',
+                    boxShadow: 'var(--shadow-sm)',
                   }}
                 >
                   {blocks.map((block) => {
@@ -423,6 +487,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                         <h3
                           key={block.id}
                           id={`anchor-${block.paragraph_anchor}`}
+                          data-source-block-id={block.id}
                           style={{
                             fontSize: '16px',
                             fontWeight: 700,
@@ -442,6 +507,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                         <div
                           key={block.id}
                           id={`anchor-${block.paragraph_anchor}`}
+                          data-source-block-id={block.id}
                           style={{
                             backgroundColor: 'var(--bg-secondary)',
                             border: '1px solid var(--border-color)',
@@ -450,7 +516,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                             margin: '14px 0',
                             overflowX: 'auto',
                             fontFamily: 'monospace',
-                            fontSize: '12px',
+                            fontSize: 'var(--font-size-xs)',
                             whiteSpace: 'pre',
                           }}
                         >
@@ -462,6 +528,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                       <p
                         key={block.id}
                         id={`anchor-${block.paragraph_anchor}`}
+                        data-source-block-id={block.id}
                         style={{
                           margin: '0 0 14px 0',
                           lineHeight: 1.8,
@@ -501,7 +568,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                         transition: 'background-color 0.12s',
                       }}
                     >
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '11px', color: 'var(--text-muted)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)' }}>
                         <span style={{ fontWeight: 500, color: 'var(--text-secondary)' }}>
                           {block.heading_path || '正文'}
                         </span>
@@ -544,11 +611,11 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '14px' }}>
                   {/* 步骤 1 */}
                   <div style={{ backgroundColor: '#FFFFFF', padding: '12px 14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 600, color: 'var(--success-text)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: 'var(--font-size-xs)', fontWeight: 600, color: 'var(--success-text)' }}>
                       <CheckCircle2 size={14} />
                       <span>1. 文件安全保存</span>
                     </div>
-                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
+                    <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)', marginTop: '4px' }}>
                       原始文件已安全持久化并生成指纹，未发生篡改。
                     </div>
                   </div>
@@ -556,27 +623,27 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                   {/* 步骤 2 */}
                   <div style={{ backgroundColor: '#FFFFFF', padding: '12px 14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)' }}>
                     {['completed', 'extracting', 'partial_failed'].includes(currentVersion?.processing_status || '') ? (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 600, color: 'var(--success-text)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: 'var(--font-size-xs)', fontWeight: 600, color: 'var(--success-text)' }}>
                         <CheckCircle2 size={14} />
                         <span>2. 正文结构解析完成</span>
                       </div>
                     ) : currentVersion?.processing_status === 'parsing' ? (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 600, color: 'var(--pending-text)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: 'var(--font-size-xs)', fontWeight: 600, color: 'var(--pending-text)' }}>
                         <RotateCw size={14} className="spin-slow" />
                         <span>2. 正文结构解析中</span>
                       </div>
                     ) : currentVersion?.processing_status === 'failed' ? (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 600, color: 'var(--error-text)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: 'var(--font-size-xs)', fontWeight: 600, color: 'var(--error-text)' }}>
                         <AlertCircle size={14} />
                         <span>2. 正文解析失败</span>
                       </div>
                     ) : (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: 'var(--font-size-xs)', fontWeight: 600, color: 'var(--text-muted)' }}>
                         <Clock size={14} />
                         <span>2. 解析排队中</span>
                       </div>
                     )}
-                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
+                    <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)', marginTop: '4px' }}>
                       {['completed', 'extracting', 'partial_failed'].includes(currentVersion?.processing_status || '')
                         ? `成功提取 ${blocks.length} 处结构块与定位锚点。`
                         : currentVersion?.error_summary || '等待后台线程解析正文'}
@@ -586,27 +653,27 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                   {/* 步骤 3 */}
                   <div style={{ backgroundColor: '#FFFFFF', padding: '12px 14px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)' }}>
                     {currentVersion?.processing_status === 'completed' ? (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 600, color: 'var(--success-text)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: 'var(--font-size-xs)', fontWeight: 600, color: 'var(--success-text)' }}>
                         <CheckCircle2 size={14} />
                         <span>3. 知识整理完成</span>
                       </div>
                     ) : currentVersion?.processing_status === 'extracting' ? (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 600, color: 'var(--brand-accent)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: 'var(--font-size-xs)', fontWeight: 600, color: 'var(--brand-accent)' }}>
                         <RotateCw size={14} className="spin-slow" />
                         <span>3. 知识抽取整理中</span>
                       </div>
                     ) : currentVersion?.processing_status === 'partial_failed' ? (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 600, color: 'var(--error-text)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: 'var(--font-size-xs)', fontWeight: 600, color: 'var(--error-text)' }}>
                         <AlertCircle size={14} />
                         <span>3. 知识提炼部分异常</span>
                       </div>
                     ) : (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: 'var(--font-size-xs)', fontWeight: 600, color: 'var(--text-muted)' }}>
                         <Clock size={14} />
                         <span>3. 知识提炼等待中</span>
                       </div>
                     )}
-                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
+                    <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)', marginTop: '4px' }}>
                       {currentVersion?.processing_status === 'completed'
                         ? '知识整理已生成候选，请在右栏逐项核对。'
                         : currentVersion?.error_summary || 'DeepSeek 大模型语义提炼'}
@@ -622,12 +689,12 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                       className="btn-primary"
                       onClick={handleRetry}
                       disabled={retrying}
-                      style={{ height: '32px', fontSize: '12px' }}
+                      style={{ height: '32px', fontSize: 'var(--font-size-xs)' }}
                     >
                       <RotateCw size={13} className={retrying ? 'spin-slow' : ''} />
                       <span>针对失败步骤重试</span>
                     </button>
-                    <span style={{ fontSize: '12px', color: 'var(--error-text)' }}>
+                    <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--error-text)' }}>
                       重试仅针对失败步骤，不覆盖已有的人工修改，不复活已删除条目。
                     </span>
                   </div>
@@ -659,7 +726,7 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                     {showRawBlocks ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
                     <span>解析结构块与技术记录 ({blocks.length})</span>
                   </div>
-                  <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                  <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)' }}>
                     {showRawBlocks ? '点击折叠' : '点击展开查看原始拆解结构块'}
                   </span>
                 </div>
@@ -673,13 +740,13 @@ export const DocumentDetailModal: React.FC<DocumentDetailModalProps> = ({
                           padding: '8px 12px',
                           borderRadius: 'var(--radius-sm)',
                           backgroundColor: 'var(--bg-secondary)',
-                          fontSize: '12px',
+                          fontSize: 'var(--font-size-xs)',
                           display: 'flex',
                           flexDirection: 'column',
                           gap: '4px',
                         }}
                       >
-                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--text-muted)' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)' }}>
                           <span>[#{b.block_index}] {b.block_type} | {b.heading_path || 'root'}</span>
                           <span>{b.paragraph_anchor}</span>
                         </div>

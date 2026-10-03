@@ -1,0 +1,390 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "zhixing/skill_schema_v1.json",
+  "title": "知行有策 Skill Schema v1",
+  "description": "Skill 结构唯一定义，依据 0926-Skill工厂模块PRD 第 3 章。x- 开头的键为本系统注释：x-group 为字段分组，x-allow-tbd 表示允许占位值 TBD_EXPERT，x-id-field 为数组元素的稳定标识字段，x-error-code 为该节点及其子节点校验失败时使用的错误编码。结构校验通过只说明字段齐全、格式合格，不代表业务正确或可以执行。",
+  "type": "object",
+  "x-schema-version": "1.0",
+  "required": [
+    "schema_version",
+    "name",
+    "goal",
+    "trigger_description",
+    "task_type",
+    "scene_id",
+    "applies_to",
+    "not_applies_to",
+    "knowledge_refs",
+    "inputs",
+    "preconditions",
+    "outputs",
+    "steps",
+    "risk_boundary",
+    "escalation_conditions",
+    "generation_confidence"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "x-group": "F",
+      "description": "Schema 版本号，当前固定为 1.0",
+      "const": "1.0"
+    },
+
+    "skill_id": {
+      "x-group": "A",
+      "description": "Skill 标识，系统填写，跨版本不变",
+      "type": ["string", "null"]
+    },
+    "name": {
+      "x-group": "A",
+      "description": "名称，动宾结构，不超过 20 字",
+      "$ref": "#/$defs/nonBlankString",
+      "maxLength": 20
+    },
+    "goal": {
+      "x-group": "A",
+      "description": "业务目标：完成什么业务动作、交付什么结果",
+      "$ref": "#/$defs/nonBlankString"
+    },
+    "trigger_description": {
+      "x-group": "A",
+      "description": "触发描述：用户会以什么方式提出这个任务，只描述一个任务",
+      "$ref": "#/$defs/nonBlankString"
+    },
+    "task_type": {
+      "x-group": "A",
+      "description": "任务类型",
+      "enum": ["计算核对", "判断分级", "流程指引", "诊断建议"]
+    },
+    "scene_id": {
+      "x-group": "A",
+      "description": "所属场景，场景目录中的 ID，生成时由所选场景写入",
+      "$ref": "#/$defs/nonBlankString"
+    },
+    "applies_to": {
+      "x-group": "A",
+      "description": "适用范围，至少一项非空",
+      "type": "object",
+      "required": ["customer_types", "property_types", "conditions"],
+      "additionalProperties": false,
+      "properties": {
+        "customer_types": { "$ref": "#/$defs/stringList" },
+        "property_types": { "$ref": "#/$defs/stringList" },
+        "conditions": { "$ref": "#/$defs/stringList" }
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            { "properties": { "customer_types": { "minItems": 1 } } },
+            { "properties": { "property_types": { "minItems": 1 } } },
+            { "properties": { "conditions": { "minItems": 1 } } }
+          ],
+          "x-error-code": "APPLIES_TO_EMPTY"
+        }
+      ]
+    },
+    "not_applies_to": {
+      "x-group": "A",
+      "description": "不适用范围，允许 TBD_EXPERT",
+      "x-allow-tbd": true,
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/nonBlankString" }
+    },
+
+    "knowledge_refs": {
+      "x-group": "B",
+      "description": "知识引用列表，至少 1 条，建议 3 到 8 条（超出区间为提示，不阻断）",
+      "type": "array",
+      "minItems": 1,
+      "x-id-field": "atom_version_id",
+      "items": { "$ref": "#/$defs/knowledgeRef" }
+    },
+
+    "inputs": {
+      "x-group": "C",
+      "description": "输入字段，至少 1 条",
+      "type": "array",
+      "minItems": 1,
+      "x-id-field": "key",
+      "items": { "$ref": "#/$defs/ioField" }
+    },
+    "preconditions": {
+      "x-group": "C",
+      "description": "前置条件：执行前必须满足的条件",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["text"],
+        "additionalProperties": false,
+        "properties": {
+          "text": { "$ref": "#/$defs/nonBlankString" },
+          "ref": {
+            "description": "依据原子版本 ID（atom_version_id）",
+            "type": ["string", "null"]
+          }
+        }
+      }
+    },
+    "outputs": {
+      "x-group": "C",
+      "description": "输出字段，结构同 inputs，至少 1 条",
+      "type": "array",
+      "minItems": 1,
+      "x-id-field": "key",
+      "items": { "$ref": "#/$defs/ioField" }
+    },
+    "output_template": {
+      "x-group": "C",
+      "description": "输出模板（Markdown），可选",
+      "type": ["string", "null"]
+    },
+
+    "steps": {
+      "x-group": "D",
+      "description": "步骤列表，至少 2 步",
+      "type": "array",
+      "minItems": 2,
+      "x-id-field": "step_id",
+      "items": { "$ref": "#/$defs/step" }
+    },
+
+    "risk_boundary": {
+      "x-group": "E",
+      "description": "风险边界，允许 TBD_EXPERT",
+      "x-allow-tbd": true,
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/nonBlankString" }
+    },
+    "escalation_conditions": {
+      "x-group": "E",
+      "description": "人工升级条件，允许 TBD_EXPERT；原子中的例外条款应优先映射到这里或 D 组分支",
+      "x-allow-tbd": true,
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/nonBlankString" }
+    },
+    "generation_confidence": {
+      "x-group": "E",
+      "description": "生成把握度：模型对候选忠实于所引原子的自评，不是业务准确率",
+      "type": "object",
+      "required": ["level", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "level": { "enum": ["高", "中", "低"] },
+        "reason": { "$ref": "#/$defs/nonBlankString" }
+      }
+    },
+    "unsupported_items": {
+      "x-group": "E",
+      "description": "无依据项清单，由系统汇总，生成时可为空",
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": ["kind", "path", "message"],
+        "properties": {
+          "kind": { "enum": ["无依据步骤", "疑似无依据数值", "例外未落点"] },
+          "path": { "type": "string" },
+          "message": { "type": "string" },
+          "item_key": { "type": "string" },
+          "value": { "type": ["string", "null"] },
+          "atom_version_id": { "type": ["string", "null"] }
+        }
+      }
+    },
+
+    "version_number": {
+      "x-group": "F",
+      "description": "Skill 版本号，系统填写",
+      "type": ["integer", "null"]
+    },
+    "status": {
+      "x-group": "F",
+      "description": "候选阶段状态，系统填写，状态流转见 PRD 7.2",
+      "enum": ["生成中", "校验未通过", "待审核", "已通过（待测试）", "已驳回", "待复核", null]
+    },
+    "generation": {
+      "x-group": "F",
+      "description": "生成来源，系统填写",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "scene_id": { "type": ["string", "null"] },
+        "batch_id": { "type": ["string", "null"] },
+        "model_name": { "type": ["string", "null"] },
+        "prompt_version": { "type": ["string", "null"] },
+        "generated_at": { "type": ["string", "null"] }
+      }
+    },
+    "review": {
+      "x-group": "F",
+      "description": "审核信息，系统填写",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "reviewer": { "type": ["string", "null"] },
+        "reviewed_at": { "type": ["string", "null"] },
+        "action": { "enum": ["通过", "修改后通过", "退回重生成", "驳回", "恢复", "复核处理", null] },
+        "comment": { "type": ["string", "null"] }
+      }
+    },
+    "stale_reason": {
+      "x-group": "F",
+      "description": "进入待复核的原因，系统填写",
+      "type": ["string", "null"]
+    },
+    "visibility": {
+      "x-group": "F",
+      "description": "可见范围，由引用原子的权限推导（R4），取值沿用 M01 access_scope",
+      "enum": ["admin_only", "org_internal", null]
+    },
+
+    "test_set_ref": {
+      "x-group": "G",
+      "description": "关联测试集，测试评测模块填写",
+      "type": ["string", "null"]
+    },
+    "tools": {
+      "x-group": "G",
+      "description": "工具建议；本模块实现状态固定为未实现",
+      "type": ["array", "null"],
+      "x-id-field": "name",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "$ref": "#/$defs/nonBlankString" },
+          "param_mapping": { "type": ["object", "null"] },
+          "implementation_status": { "enum": ["未实现", "已实现", "已验证"] }
+        }
+      }
+    },
+    "pricing": {
+      "x-group": "G",
+      "description": "计费方式与价格建议，商品化模块填写",
+      "type": ["object", "null"]
+    },
+    "license": {
+      "x-group": "G",
+      "description": "授权范围，商品化模块填写",
+      "type": ["string", "object", "null"]
+    },
+    "maintainer": {
+      "x-group": "G",
+      "description": "维护人，审核通过时可指定",
+      "type": ["string", "null"]
+    },
+    "published_at": {
+      "x-group": "G",
+      "description": "发布时间，发布模块填写",
+      "type": ["string", "null"]
+    }
+  },
+
+  "$defs": {
+    "nonBlankString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "stringList": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/nonBlankString" }
+    },
+    "knowledgeRef": {
+      "type": "object",
+      "required": ["atom_item_id", "atom_version_id", "role", "used_in_steps"],
+      "additionalProperties": false,
+      "properties": {
+        "atom_item_id": { "$ref": "#/$defs/nonBlankString" },
+        "atom_version_id": { "$ref": "#/$defs/nonBlankString" },
+        "role": { "enum": ["前置条件", "判断规则", "执行动作", "例外处理", "指标口径", "案例参考"] },
+        "role_reason": {
+          "description": "角色与五类默认对应不一致时的说明（PRD 4.3）",
+          "type": ["string", "null"]
+        },
+        "used_in_steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlankString" }
+        }
+      },
+      "if": {
+        "required": ["role"],
+        "properties": { "role": { "enum": ["前置条件", "判断规则", "执行动作", "例外处理", "指标口径"] } }
+      },
+      "then": {
+        "properties": { "used_in_steps": { "minItems": 1 } },
+        "x-error-code": "USED_IN_STEPS_EMPTY"
+      }
+    },
+    "ioField": {
+      "type": "object",
+      "required": ["key", "label", "type", "required"],
+      "additionalProperties": false,
+      "properties": {
+        "key": { "$ref": "#/$defs/nonBlankString" },
+        "label": { "$ref": "#/$defs/nonBlankString" },
+        "type": { "enum": ["text", "number", "boolean", "enum", "date", "period", "file"] },
+        "required": { "type": "boolean" },
+        "unit": { "type": ["string", "null"] },
+        "allowed_values": { "type": ["array", "null"] },
+        "source_ref": {
+          "description": "口径依据原子版本 ID（atom_version_id），指标类输入应指向提供口径的原子",
+          "type": ["string", "null"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["type"],
+            "properties": { "type": { "const": "number" } }
+          },
+          "then": {
+            "required": ["unit"],
+            "properties": { "unit": { "$ref": "#/$defs/nonBlankString" } },
+            "x-error-code": "NUMBER_UNIT_MISSING"
+          }
+        },
+        {
+          "if": {
+            "required": ["type"],
+            "properties": { "type": { "const": "enum" } }
+          },
+          "then": {
+            "required": ["allowed_values"],
+            "properties": { "allowed_values": { "type": "array", "minItems": 1 } },
+            "x-error-code": "ENUM_ALLOWED_VALUES_MISSING"
+          }
+        }
+      ]
+    },
+    "step": {
+      "type": "object",
+      "required": ["step_id", "kind", "action", "basis", "on_fail"],
+      "additionalProperties": false,
+      "properties": {
+        "step_id": { "$ref": "#/$defs/nonBlankString" },
+        "kind": { "enum": ["输入校验", "知识检索", "计算", "规则判断", "生成表达", "人工确认"] },
+        "condition": {
+          "description": "执行条件，为空表示顺序执行，有值表示分支",
+          "type": ["string", "null"]
+        },
+        "action": { "$ref": "#/$defs/nonBlankString" },
+        "refs": {
+          "description": "依据原子版本 ID 列表，要求见 R3",
+          "type": "array",
+          "items": { "$ref": "#/$defs/nonBlankString" }
+        },
+        "basis": { "enum": ["有原子依据", "无依据", "通用操作", "专家补充"] },
+        "expert_reason": {
+          "description": "basis 为专家补充时由审核人填写的理由（FR11）",
+          "type": ["string", "null"]
+        },
+        "on_fail": { "enum": ["补问", "暂停", "转人工", "返回不可计算"] }
+      }
+    }
+  }
+}

@@ -23,7 +23,7 @@ export const UnsavedChangesModal: React.FC<UnsavedChangesModalProps> = ({
       style={{
         position: 'fixed',
         inset: 0,
-        backgroundColor: 'rgba(0, 0, 0, 0.45)',
+        backgroundColor: 'rgba(18, 26, 22, 0.42)',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
@@ -36,7 +36,7 @@ export const UnsavedChangesModal: React.FC<UnsavedChangesModalProps> = ({
           width: '420px',
           backgroundColor: '#FFFFFF',
           borderRadius: 'var(--radius-lg)',
-          boxShadow: '0 8px 30px rgba(0, 0, 0, 0.15)',
+          boxShadow: 'var(--shadow-lg)',
           padding: '24px',
           display: 'flex',
           flexDirection: 'column',

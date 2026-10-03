@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timezone
 from database import get_db, init_db
 from auth import hash_password
@@ -23,9 +24,18 @@ def seed_data(force: bool = False):
         )
         
         # 2. 预置测试账号 (Users)
-        admin_pass = hash_password("Admin@Zhixing2026")
-        member_pass = hash_password("Member@Zhixing2026")
-        other_pass = hash_password("Other@Zhixing2026")
+        admin_password = os.getenv("ZHIXING_DEMO_ADMIN_PASSWORD")
+        member_password = os.getenv("ZHIXING_DEMO_MEMBER_PASSWORD")
+        other_password = os.getenv("ZHIXING_DEMO_OTHER_PASSWORD")
+        if not all((admin_password, member_password, other_password)):
+            raise RuntimeError(
+                "演示数据初始化需要显式配置 ZHIXING_DEMO_ADMIN_PASSWORD、"
+                "ZHIXING_DEMO_MEMBER_PASSWORD、ZHIXING_DEMO_OTHER_PASSWORD"
+            )
+
+        admin_pass = hash_password(admin_password)
+        member_pass = hash_password(member_password)
+        other_pass = hash_password(other_password)
 
         action = "INSERT OR REPLACE" if force else "INSERT OR IGNORE"
         
@@ -67,7 +77,7 @@ def sanitize_existing_anomalies():
     要求：
     - 不静默删除已有人工确认内容；
     - 已有异常记录要明确标识并按受控方式处理；
-    - 未经人工核对的纯符号/无效提取（如陈述为 ---），受控转为 excluded（不收录），移出待核对队列并保留记录；
+    - 未经人工核对的纯符号/无效提取（如陈述为 ---），受控转为排除（is_excluded=1，不收录），移出待核对队列并保留记录，不破坏 lifecycle_status CHECK 约束；
     - 已有人工确认的异常数据，保留并打上复核质检标记。
     """
     import json
@@ -105,8 +115,16 @@ def sanitize_existing_anomalies():
                     if exclude_flag not in q_flags:
                         q_flags.append(exclude_flag)
                     conn.execute(
-                        "UPDATE knowledge_items SET lifecycle_status = 'excluded', updated_at = ? WHERE id = ?",
-                        (now_iso, r["item_id"])
+                        """
+                        UPDATE knowledge_items
+                        SET is_excluded = 1,
+                            excluded_at = ?,
+                            excluded_by = 'system_sanitizer',
+                            exclusion_reason = '内容无实质业务含义(系统清洗)',
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now_iso, now_iso, r["item_id"])
                     )
                     conn.execute(
                         "UPDATE knowledge_versions SET quality_flags_json = ? WHERE id = ?",

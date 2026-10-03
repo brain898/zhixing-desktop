@@ -1,18 +1,101 @@
 import json
 import uuid
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from threading import Lock
+import time
 
+from config import resolve_storage_path
 from database import get_db
 from parser import parse_file_to_blocks
+from indexing import (
+    build_index_for_version,
+    execute_build_index_task,
+    execute_clean_index_task,
+    ensure_missing_stage4b_index_tasks,
+)
 
 logger = logging.getLogger(__name__)
 
 # 后端持久化任务工作线程池（2个并发处理工作者，足以支撑桌面端轻量并发）
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="zhixing-worker")
+_background_futures: set[Future] = set()
+_background_futures_lock = Lock()
+
+
+def _track_future(future: Future) -> None:
+    with _background_futures_lock:
+        _background_futures.add(future)
+
+    def _remove(completed: Future) -> None:
+        with _background_futures_lock:
+            _background_futures.discard(completed)
+
+    future.add_done_callback(_remove)
+
+
+def wait_for_background_tasks(timeout: float = 30.0) -> bool:
+    """等待已提交任务（含任务链中新提交的任务）真正退出线程函数。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        with _background_futures_lock:
+            pending = list(_background_futures)
+        if not pending:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        wait(pending, timeout=min(remaining, 0.25))
+
+
+def submit_background(func, *args) -> Future:
+    """Submit independent work and include its lifetime in cleanup/startup tracking."""
+    future = _executor.submit(func, *args)
+    _track_future(future)
+    return future
+
+
+def enqueue_jev_evaluation(knowledge_version_id: str, retry_failed: bool = False) -> dict:
+    """轻量幂等入队。Jev 关闭或未配置时只记录状态，不提交网络任务。"""
+    from jev_evaluator import create_or_get_evaluation, execute_evaluation
+
+    result = create_or_get_evaluation(knowledge_version_id, retry_failed=retry_failed)
+    if result["should_submit"]:
+        future = _executor.submit(execute_evaluation, result["evaluation_id"])
+        _track_future(future)
+    return result
+
+
+def enqueue_scene_merge_suggestion(suggestion_id: str) -> None:
+    """M02 FR01 归并建议：独立任务表 scene_merge_suggestions，复用同一线程池与完成跟踪。"""
+    from scene_catalog import run_merge_suggestion
+
+    future = _executor.submit(run_merge_suggestion, suggestion_id)
+    _track_future(future)
+
+
+def enqueue_skill_generation_task(task_id: str) -> None:
+    """M02-C 生成批次：独立任务表 skill_generation_tasks，复用同一线程池（并发上限与 M01 抽取一致）。"""
+    from skill_generation import run_generation_task
+
+    future = _executor.submit(run_generation_task, task_id)
+    _track_future(future)
+
+
+def enqueue_skill_review_task(task_id: str) -> None:
+    """M02-D 退回重生成：独立任务表 skill_review_tasks，复用同一线程池与完成跟踪。"""
+    from skill_review import run_review_task
+
+    future = _executor.submit(run_review_task, task_id)
+    _track_future(future)
+
+def enqueue_consult_task(task_id: str) -> None:
+    from consult import run_consult_task
+    submit_background(run_consult_task, task_id)
+
 
 def execute_parse_task(task_id: str):
     """
@@ -64,7 +147,7 @@ def execute_parse_task(task_id: str):
             (task["target_id"],)
         )
 
-    file_path = Path(task["storage_reference"])
+    file_path = resolve_storage_path(task["storage_reference"])
     version_id = task["target_id"]
     org_id = task["organization_id"]
 
@@ -168,14 +251,13 @@ def execute_parse_task(task_id: str):
 def execute_extract_task(task_id: str):
     """
     持久化知识原子抽取与校验执行流：
-    1. 调用 DeepSeek API 或优雅降级至结构化离线提炼引擎。
+    1. 调用 DeepSeek API 进行分批抽取；未配置或报错时明确失败并记录异常。
     2. 执行程序语义与来源校验（validate_and_sanitize_atoms）。
     3. 写入 knowledge_items、knowledge_versions 与 knowledge_evidence。
     4. 保证重试幂等：不覆盖已有的人工修改记录，不复活已被删除的知识候选。
     """
     from deepseek_extractor import (
-        extract_atoms_via_deepseek,
-        rule_based_extract_atoms,
+        extract_atoms_via_deepseek_batched,
         validate_and_sanitize_atoms,
     )
     from config import DEEPSEEK_API_KEY
@@ -249,29 +331,25 @@ def execute_extract_task(task_id: str):
             )
         return
 
+    created_version_ids = []
     try:
-        raw_candidates = []
-        extraction_ctx = {}
+        # 调用 DeepSeek API 进行知识抽取；未配置或调用报错时明确抛出异常
+        if not DEEPSEEK_API_KEY:
+            raise RuntimeError("在线模型未配置，无法执行知识抽取")
 
-        # 尝试调用 DeepSeek API；若未配置或调用报错，降级至规则提取器
-        if DEEPSEEK_API_KEY:
-            try:
-                raw_candidates, extraction_ctx = extract_atoms_via_deepseek(
-                    source_blocks=source_blocks,
-                    document_title=doc_title,
-                )
-            except Exception as e:
-                logger.warning(f"DeepSeek online extraction failed, falling back to rule adapter: {e}")
-                raw_candidates, extraction_ctx = rule_based_extract_atoms(
-                    source_blocks=source_blocks,
-                    document_title=doc_title,
-                )
-                extraction_ctx["fallback_reason"] = str(e)
-        else:
-            raw_candidates, extraction_ctx = rule_based_extract_atoms(
-                source_blocks=source_blocks,
-                document_title=doc_title,
-            )
+        # M01-C1：有场景目录时提供给模型；无目录时不传参数，抽取行为与原来一致。
+        from scene_catalog import get_catalog_for_extraction, register_unmatched_scene_tags
+        with get_db() as conn:
+            scene_catalog = get_catalog_for_extraction(conn, org_id)
+        catalog_kwargs = {"scene_catalog": scene_catalog} if scene_catalog else {}
+
+        raw_candidates, extraction_ctx = extract_atoms_via_deepseek_batched(
+            source_blocks=source_blocks,
+            document_title=doc_title,
+            organization_id=org_id,
+            document_version_id=version_id,
+            **catalog_kwargs,
+        )
 
         # 执行程序语义与来源证据严格校验
         sanitized_atoms = validate_and_sanitize_atoms(
@@ -298,7 +376,7 @@ def execute_extract_task(task_id: str):
             # 查询已有条目（避免重试时覆盖已人工修改/已确认项，或复活已删除条目）
             existing_items = conn.execute(
                 """
-                SELECT ki.id, ki.lifecycle_status, kv.review_status, kv.reviewed_by, kv.title
+                SELECT ki.id, ki.lifecycle_status, ki.is_excluded, kv.review_status, kv.reviewed_by, kv.title, kv.statement
                 FROM knowledge_items ki
                 JOIN knowledge_versions kv ON ki.active_version_id = kv.id
                 WHERE ki.document_id = ?
@@ -306,8 +384,16 @@ def execute_extract_task(task_id: str):
                 (doc_id,)
             ).fetchall()
 
-            deleted_titles = {r["title"] for r in existing_items if r["lifecycle_status"] in ("deleted", "excluded")}
+            deleted_titles = {
+                r["title"] for r in existing_items
+                if r["lifecycle_status"] == "deleted" or (r["is_excluded"] == 1 if "is_excluded" in r.keys() else False)
+            }
             manual_titles = {r["title"] for r in existing_items if r["review_status"] == "confirmed" or r["reviewed_by"] is not None}
+            manual_statements = {
+                (r["statement"] or "").strip()
+                for r in existing_items
+                if (r["review_status"] == "confirmed" or r["reviewed_by"] is not None) and (r["statement"] or "").strip()
+            }
 
             # 清除该版本原有的未校对候选版本，以便更新
             conn.execute(
@@ -338,7 +424,7 @@ def execute_extract_task(task_id: str):
                     continue
 
                 # 规则 2：已有且已人工校对的候选不被重试结果覆盖
-                if atom["title"] in manual_titles:
+                if atom["title"] in manual_titles or (atom.get("statement") or "").strip() in manual_statements:
                     logger.info(f"Skipping atom 「{atom['title']}」: already reviewed/confirmed by admin.")
                     continue
 
@@ -370,8 +456,8 @@ def execute_extract_task(task_id: str):
                      conditions_json, actions_json, exceptions_json, metric_definition_json, case_details_json,
                      field_states_json, quality_flags_json, customer_types_json, business_scenes_json, problem_tags_json,
                      source_anchors_json, valid_from, valid_until, review_status, index_status, revision_token,
-                     extraction_context_json, related_cases_json, created_at, created_by)
-                    VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', 'not_indexed', ?, ?, ?, ?, 'system_extractor')
+                     extraction_context_json, related_cases_json, business_importance, importance_rationale, created_at, created_by)
+                    VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', 'not_indexed', ?, ?, ?, ?, ?, ?, 'system_extractor')
                     """,
                     (
                         version_id_k,
@@ -398,8 +484,10 @@ def execute_extract_task(task_id: str):
                         atom.get("valid_from"),
                         atom.get("valid_until"),
                         rev_token,
-                        json.dumps(extraction_ctx, ensure_ascii=False),
+                        json.dumps({**extraction_ctx, **atom.get("_extraction_context", {})}, ensure_ascii=False),
                         json.dumps(atom.get("related_cases") or [], ensure_ascii=False),
+                        atom.get("business_importance", "normal"),
+                        atom.get("importance_rationale", "常规业务规程、作业标准或指标要求"),
                         now_iso,
                     )
                 )
@@ -427,6 +515,12 @@ def execute_extract_task(task_id: str):
                         """,
                         evidence_rows
                     )
+                # M01-C2：目录外的新标签仍保存在原子上，同时进入待归并列表（无目录时不处理）
+                register_unmatched_scene_tags(
+                    conn, org_id, atom["business_scenes"], item_id, version_id_k,
+                    "extraction", title=atom["title"], now_iso=now_iso,
+                )
+                created_version_ids.append(version_id_k)
 
             # 更新任务与版本状态为 completed
             completed_iso = datetime.now(timezone.utc).isoformat()
@@ -438,6 +532,13 @@ def execute_extract_task(task_id: str):
                 "UPDATE document_versions SET processing_status = 'completed', error_summary = NULL WHERE id = ?",
                 (version_id,)
             )
+
+        # Jev 是独立的后置质检：失败、关闭或缺少 Key 都不得回滚已保存候选。
+        for candidate_version_id in created_version_ids:
+            try:
+                enqueue_jev_evaluation(candidate_version_id)
+            except Exception:
+                logger.exception("Failed to enqueue Jev evaluation for %s", candidate_version_id)
 
         logger.info(f"Extract task {task_id} completed successfully with {len(sanitized_atoms)} atom candidates.")
 
@@ -456,138 +557,6 @@ def execute_extract_task(task_id: str):
             )
 
 
-def build_index_for_version(conn, version_id: str, org_id: str) -> str:
-    """
-    为指定知识版本构建检索索引记录（retrieval_records）并置 index_status 为 ready。
-    组合标题、陈述、主体、条件、动作、例外、指标与业务标签生成综合检索文本。
-    """
-    now_iso = datetime.now(timezone.utc).isoformat()
-    row = conn.execute(
-        """
-        SELECT kv.*, d.title as doc_title
-        FROM knowledge_versions kv
-        JOIN knowledge_items ki ON kv.item_id = ki.id
-        JOIN documents d ON ki.document_id = d.id
-        WHERE kv.id = ? AND kv.organization_id = ? AND ki.lifecycle_status != 'deleted' AND d.is_deleted = 0
-        """,
-        (version_id, org_id)
-    ).fetchone()
-
-    if not row:
-        raise ValueError(f"知识版本 {version_id} 不存在或对应资料已被删除")
-
-    parts = []
-    if row["title"]:
-        parts.append(f"【标题】{row['title']}")
-    if row["primary_category"]:
-        parts.append(f"【分类】{row['primary_category']}")
-    if row["subject"]:
-        parts.append(f"【责任主体】{row['subject']}")
-    if row["statement"]:
-        parts.append(f"【核心结论】{row['statement']}")
-    if row["content"] and row["content"] != row["statement"]:
-        parts.append(f"【正文详情】{row['content']}")
-
-    conditions = json.loads(row["conditions_json"] or "[]")
-    if conditions:
-        parts.append(f"【适用条件】{'；'.join(conditions)}")
-
-    actions = json.loads(row["actions_json"] or "[]")
-    if actions:
-        parts.append(f"【执行动作】{'；'.join(actions)}")
-
-    exceptions = json.loads(row["exceptions_json"] or "[]")
-    if exceptions:
-        parts.append(f"【例外与禁止】{'；'.join(exceptions)}")
-
-    if row["metric_definition_json"]:
-        m = json.loads(row["metric_definition_json"])
-        parts.append(f"【指标要求】名称:{m.get('name', '')} 单位:{m.get('unit', '')} 统计期:{m.get('period', '')} 基准:{m.get('criteria', '')}")
-
-    if row["case_details_json"]:
-        c = json.loads(row["case_details_json"])
-        parts.append(f"【案例实战】背景:{c.get('background', '')} 动作:{c.get('actions', '')} 效果:{c.get('results', '')}")
-
-    customer_types = json.loads(row["customer_types_json"] or "[]")
-    if customer_types:
-        parts.append(f"【客户类型】{' '.join(customer_types)}")
-
-    business_scenes = json.loads(row["business_scenes_json"] or "[]")
-    if business_scenes:
-        parts.append(f"【业务场景】{' '.join(business_scenes)}")
-
-    problem_tags = json.loads(row["problem_tags_json"] or "[]")
-    if problem_tags:
-        parts.append(f"【解决问题】{' '.join(problem_tags)}")
-
-    if row["doc_title"]:
-        parts.append(f"【来源资料】{row['doc_title']}")
-
-    search_text = "\n".join(parts)
-
-    # 清除历史旧索引
-    conn.execute("DELETE FROM retrieval_records WHERE knowledge_version_id = ?", (version_id,))
-
-    record_id = f"ret_{uuid.uuid4().hex[:12]}"
-    conn.execute(
-        """
-        INSERT INTO retrieval_records 
-        (id, knowledge_version_id, organization_id, search_text, vector_json, model_name, index_version, created_at)
-        VALUES (?, ?, ?, ?, NULL, 'keyword-v1', 1, ?)
-        """,
-        (record_id, version_id, org_id, search_text, now_iso)
-    )
-
-    conn.execute(
-        "UPDATE knowledge_versions SET index_status = 'ready' WHERE id = ?",
-        (version_id,)
-    )
-
-    return record_id
-
-
-def execute_build_index_task(task_id: str):
-    """
-    持久化索引构建执行流：
-    将知识条目版本解析并写入 retrieval_records，置 index_status 为 ready。
-    """
-    now_iso = datetime.now(timezone.utc).isoformat()
-    with get_db() as conn:
-        task = conn.execute(
-            "SELECT id, organization_id, target_id, status FROM processing_tasks WHERE id = ?",
-            (task_id,)
-        ).fetchone()
-        if not task or task["status"] == "cancelled":
-            return
-
-        conn.execute(
-            "UPDATE processing_tasks SET status = 'running', started_at = ? WHERE id = ?",
-            (now_iso, task_id)
-        )
-        version_id = task["target_id"]
-        org_id = task["organization_id"]
-        conn.execute("UPDATE knowledge_versions SET index_status = 'indexing' WHERE id = ?", (version_id,))
-
-    try:
-        with get_db() as conn:
-            build_index_for_version(conn, version_id, org_id)
-            conn.execute(
-                "UPDATE processing_tasks SET status = 'completed', completed_at = ? WHERE id = ?",
-                (datetime.now(timezone.utc).isoformat(), task_id)
-            )
-        logger.info(f"Build index task {task_id} completed for version {version_id}.")
-    except Exception as e:
-        logger.error(f"Build index task {task_id} failed: {e}", exc_info=True)
-        err_msg = str(e)
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE processing_tasks SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?",
-                (err_msg, datetime.now(timezone.utc).isoformat(), task_id)
-            )
-            conn.execute(
-                "UPDATE knowledge_versions SET index_status = 'failed' WHERE id = ?",
-                (version_id,)
-            )
 
 
 def submit_task(task_id: str):
@@ -601,32 +570,160 @@ def submit_task(task_id: str):
             return
 
         t_type = task["task_type"]
+        future = None
         if t_type == "parse_document":
-            _executor.submit(execute_parse_task, task_id)
+            future = _executor.submit(execute_parse_task, task_id)
         elif t_type == "extract_atoms":
-            _executor.submit(execute_extract_task, task_id)
+            future = _executor.submit(execute_extract_task, task_id)
         elif t_type == "build_index":
-            _executor.submit(execute_build_index_task, task_id)
+            future = _executor.submit(execute_build_index_task, task_id)
+        elif t_type == "clean_index":
+            future = _executor.submit(execute_clean_index_task, task_id)
         else:
             logger.info(f"Task type {t_type} handler pending next stage.")
+        if future is not None:
+            _track_future(future)
+
+
 
 
 def recover_interrupted_tasks():
-    """
-    服务启动恢复机制：
-    查找所有在服务意外停止前处于 'running' 或 'queued' 的任务，恢复排队并重新投递执行。
-    """
+    """恢复 document/knowledge 两类持久化任务，并补建 Stage 4B 遗留索引。"""
+    recover_ids = []
     with get_db() as conn:
         tasks = conn.execute(
             """
-            SELECT pt.id, pt.task_type
-            FROM processing_tasks pt
-            JOIN documents d ON (SELECT document_id FROM document_versions WHERE id = pt.target_id) = d.id
-            WHERE pt.status IN ('queued', 'running') AND d.is_deleted = 0
+            SELECT id, target_type, target_id, task_type, status
+            FROM processing_tasks
+            WHERE status IN ('queued', 'running')
+            ORDER BY created_at
             """
         ).fetchall()
 
-        for t in tasks:
-            logger.info(f"Recovering {t['task_type']} task {t['id']} on startup.")
-            submit_task(t["id"])
+        for task in tasks:
+            valid = False
+            if task["target_type"] == "document_version":
+                row = conn.execute(
+                    """
+                    SELECT d.is_deleted
+                    FROM document_versions dv
+                    JOIN documents d ON d.id = dv.document_id
+                    WHERE dv.id = ?
+                    """,
+                    (task["target_id"],),
+                ).fetchone()
+                valid = bool(row and int(row["is_deleted"] or 0) == 0)
+            elif task["target_type"] == "knowledge_version":
+                if task["task_type"] == "clean_index":
+                    # 清理任务恰恰需要在知识/文件已失效后继续执行并可跨重启恢复。
+                    row = conn.execute(
+                        "SELECT id FROM knowledge_versions WHERE id = ?",
+                        (task["target_id"],),
+                    ).fetchone()
+                    valid = bool(row)
+                else:
+                    row = conn.execute(
+                        """
+                        SELECT kv.review_status, ki.lifecycle_status, ki.is_excluded,
+                               ki.active_version_id, ki.pending_version_id, d.is_deleted
+                        FROM knowledge_versions kv
+                        JOIN knowledge_items ki ON ki.id = kv.item_id
+                        JOIN documents d ON d.id = ki.document_id
+                        WHERE kv.id = ?
+                        """,
+                        (task["target_id"],),
+                    ).fetchone()
+                    valid = bool(
+                        row
+                        and row["review_status"] == "confirmed"
+                        and row["lifecycle_status"] == "active"
+                        and int(row["is_excluded"] or 0) == 0
+                        and task["target_id"] in (row["active_version_id"], row["pending_version_id"])
+                        and int(row["is_deleted"] or 0) == 0
+                    )
 
+            if not valid:
+                conn.execute(
+                    "UPDATE processing_tasks SET status = 'cancelled', error_message = ?, completed_at = ? WHERE id = ?",
+                    ("恢复时目标已失效", datetime.now(timezone.utc).isoformat(), task["id"]),
+                )
+                if task["target_type"] == "knowledge_version":
+                    conn.execute(
+                        """
+                        UPDATE knowledge_versions SET index_status = 'not_indexed'
+                        WHERE id = ? AND index_status = 'indexing'
+                        """,
+                        (task["target_id"],),
+                    )
+                continue
+
+            if task["status"] == "running":
+                conn.execute(
+                    """
+                    UPDATE processing_tasks
+                    SET status = 'queued', started_at = NULL, completed_at = NULL
+                    WHERE id = ?
+                    """,
+                    (task["id"],),
+                )
+            recover_ids.append(task["id"])
+
+    for task_id in recover_ids:
+        logger.info("Recovering persisted task %s on startup.", task_id)
+        submit_task(task_id)
+
+    # Stage 4A 的 keyword-v1 记录不再视为 Stage 4B 完成；
+    # 仅为未失败的当前确认版本补建当前 config_hash 的真实向量索引。
+    for task_id in ensure_missing_stage4b_index_tasks():
+        submit_task(task_id)
+
+    # Jev 任务不复用检索任务状态机，避免改变既有 processing_tasks CHECK 约束。
+    # 服务重启后仅恢复明确 queued/running 的当前版本评估，不批量扫描既有知识库。
+    from jev_evaluator import execute_evaluation
+    jev_ids = []
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT je.id, je.knowledge_version_id, je.candidate_revision_token,
+                      kv.revision_token AS current_revision_token
+               FROM jev_evaluations je
+               LEFT JOIN knowledge_versions kv ON kv.id = je.knowledge_version_id
+               WHERE je.status IN ('queued', 'running') ORDER BY je.created_at"""
+        ).fetchall()
+        for row in rows:
+            if not row["current_revision_token"] or row["current_revision_token"] != row["candidate_revision_token"]:
+                conn.execute(
+                    "UPDATE jev_evaluations SET status='stale', completed_at=? WHERE id=?",
+                    (datetime.now(timezone.utc).isoformat(), row["id"]),
+                )
+                continue
+            if row["id"]:
+                conn.execute("UPDATE jev_evaluations SET status='queued', started_at=NULL WHERE id=?", (row["id"],))
+                jev_ids.append(row["id"])
+    for evaluation_id in jev_ids:
+        future = _executor.submit(execute_evaluation, evaluation_id)
+        _track_future(future)
+
+    # M02 FR01 归并建议：重启后把中断的 queued/running 建议重新排队执行。
+    suggestion_ids = []
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id FROM scene_merge_suggestions WHERE status IN ('queued', 'running') ORDER BY created_at"
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE scene_merge_suggestions SET status = 'queued', started_at = NULL WHERE id = ?",
+                (row["id"],),
+            )
+            suggestion_ids.append(row["id"])
+    for suggestion_id in suggestion_ids:
+        enqueue_scene_merge_suggestion(suggestion_id)
+
+    # M02-C 生成批次：进行中批次的 queued/running 任务重新排队，已结束批次的残留任务取消。
+    from skill_generation import recover_generation_tasks
+    recover_generation_tasks()
+
+    # M02-D 退回重生成：排队或进行中的任务重新排队；没有任务的「生成中」Skill 恢复到可操作状态。
+    from skill_review import recover_review_tasks
+    recover_review_tasks()
+    from consult import recover_consult_tasks
+    recover_consult_tasks()

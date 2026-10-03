@@ -4,7 +4,9 @@
   "private": true,
   "main": "dist-electron/main.js",
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "npm run typecheck:frontend && npm run typecheck:electron",
+    "typecheck:frontend": "tsc --noEmit",
+    "typecheck:electron": "tsc -p tsconfig.electron.json --noEmit",
     "dev:vite": "vite",
     "build:vite": "tsc --noEmit && vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
@@ -13,7 +15,6 @@
     "build": "npm run build:vite && npm run build:electron"
   },
   "dependencies": {
-    "clsx": "^2.1.1",
     "lucide-react": "^1.16.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
@@ -26,6 +27,7 @@
     "concurrently": "^9.0.1",
     "cross-env": "^7.0.3",
     "electron": "^32.1.0",
+    "rcedit": "^4.0.1",
     "typescript": "^5.5.4",
     "vite": "^5.4.3",
     "wait-on": "^8.0.0"

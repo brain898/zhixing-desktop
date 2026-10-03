@@ -1,7 +1,8 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { FileText, Wrench, Bot, Settings, ChevronDown, LogOut, Building } from 'lucide-react';
+import { FileText, Wrench, Bot, Settings, ChevronsUpDown, LogOut, Building, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { Logo } from '../common/Logo';
 import { useAuth } from '../../context/AuthContext';
+import { useLayout } from '../../context/LayoutContext';
 import { NavItemKey } from '../../types';
 
 interface GlobalSidebarProps {
@@ -11,10 +12,12 @@ interface GlobalSidebarProps {
 
 export const GlobalSidebar: React.FC<GlobalSidebarProps> = ({ currentNav, onSelectNav }) => {
   const { user, logout } = useAuth();
+  const { isSidebarRail, focusMode, toggleSidebar } = useLayout();
   const [showUserMenu, setShowUserMenu] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   const isAdmin = user?.role === 'admin';
+  const collapsed = isSidebarRail;
 
   // 点击外部关闭弹层
   useEffect(() => {
@@ -31,19 +34,19 @@ export const GlobalSidebar: React.FC<GlobalSidebarProps> = ({ currentNav, onSele
     {
       key: 'knowledge',
       label: '知识管理',
-      icon: <FileText size={18} />,
+      icon: <FileText size={17} />,
       adminOnly: true, // 仅管理员可见
     },
     {
       key: 'skills',
       label: 'Skill 工厂',
-      icon: <Wrench size={18} />,
+      icon: <Wrench size={17} />,
       adminOnly: true, // 仅管理员可见，普通成员不显示
     },
     {
       key: 'agent',
       label: 'Agent 咨询',
-      icon: <Bot size={18} />,
+      icon: <Bot size={17} />,
       adminOnly: false, // 普通成员唯一可见的业务入口
     },
   ];
@@ -58,72 +61,70 @@ export const GlobalSidebar: React.FC<GlobalSidebarProps> = ({ currentNav, onSele
 
   return (
     <aside
+      className={collapsed ? 'zx-sidebar-collapsed' : undefined}
       style={{
-        width: 'var(--sidebar-width)',
+        width: collapsed ? 'var(--sidebar-rail-width)' : 'var(--sidebar-width)',
         backgroundColor: 'var(--bg-secondary)',
         borderRight: '1px solid var(--border-color)',
         display: 'flex',
         flexDirection: 'column',
         justifyContent: 'space-between',
-        padding: '16px 12px 14px 12px',
+        alignItems: collapsed ? 'center' : 'stretch',
+        padding: collapsed ? '16px 8px 12px' : '16px 10px 12px',
         flexShrink: 0,
         height: '100%',
         userSelect: 'none',
         position: 'relative',
+        transition: 'width 180ms cubic-bezier(0.16, 1, 0.3, 1)',
       }}
     >
       {/* 顶部区域 */}
-      <div>
-        {/* Logo 区域 */}
-        <div style={{ padding: '4px 6px 18px 6px' }}>
-          <Logo />
+      <div style={{ width: '100%', display: 'flex', flexDirection: 'column', alignItems: collapsed ? 'center' : 'stretch' }}>
+        {/* Logo 与折叠按钮 */}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: collapsed ? 'center' : 'space-between',
+            padding: collapsed ? '2px 0 20px' : '2px 0 20px 8px',
+          }}
+        >
+          <Logo showText={!collapsed} />
+          {!collapsed && (
+            <button
+              className="btn-ghost btn-sm btn-icon"
+              style={{ width: '28px' }}
+              title="收起侧栏"
+              onClick={toggleSidebar}
+            >
+              <PanelLeftClose size={16} />
+            </button>
+          )}
         </div>
 
         {/* 区域小标题 */}
-        <div
-          style={{
-            padding: '0 8px 8px 8px',
-            fontSize: 'var(--font-size-xs)',
-            color: 'var(--text-muted)',
-            fontWeight: 500,
-          }}
-        >
-          工作空间
-        </div>
+        {!collapsed && (
+          <div style={{ padding: '0 10px 6px', fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)' }}>
+            工作空间
+          </div>
+        )}
 
         {/* 导航菜单项 */}
-        <nav style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+        <nav style={{ display: 'flex', flexDirection: 'column', gap: '2px', alignItems: collapsed ? 'center' : 'stretch' }}>
           {visibleNavItems.map((item) => {
             const isActive = currentNav === item.key;
             return (
               <button
                 key={item.key}
                 onClick={() => onSelectNav(item.key)}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '10px',
-                  width: '100%',
-                  padding: '9px 12px',
-                  borderRadius: 'var(--radius-md)',
-                  backgroundColor: isActive ? 'var(--bg-selected)' : 'transparent',
-                  color: isActive ? 'var(--brand-accent)' : 'var(--text-primary)',
-                  fontWeight: isActive ? 600 : 400,
-                  fontSize: 'var(--font-size-base)',
-                  transition: 'background-color 120ms ease, color 120ms ease',
-                  textAlign: 'left',
-                }}
-                onMouseEnter={(e) => {
-                  if (!isActive) e.currentTarget.style.backgroundColor = '#EFEFEF';
-                }}
-                onMouseLeave={(e) => {
-                  if (!isActive) e.currentTarget.style.backgroundColor = 'transparent';
-                }}
+                className={`zx-nav-item${isActive ? ' active' : ''}`}
+                title={collapsed ? item.label : undefined}
+                aria-label={item.label}
               >
-                <span style={{ color: isActive ? 'var(--brand-accent)' : 'var(--text-secondary)' }}>
+                <span className="zx-nav-icon" style={{ display: 'flex' }}>
                   {item.icon}
                 </span>
-                <span>{item.label}</span>
+                {!collapsed && <span>{item.label}</span>}
               </button>
             );
           })}
@@ -131,103 +132,90 @@ export const GlobalSidebar: React.FC<GlobalSidebarProps> = ({ currentNav, onSele
       </div>
 
       {/* 底部设置与账号区域 */}
-      <div style={{ position: 'relative' }} ref={menuRef}>
+      <div
+        style={{ position: 'relative', width: '100%', display: 'flex', flexDirection: 'column', alignItems: collapsed ? 'center' : 'stretch' }}
+        ref={menuRef}
+      >
+        {collapsed && !focusMode && (
+          <button className="zx-nav-item" title="展开侧栏" onClick={toggleSidebar} style={{ marginBottom: '2px' }}>
+            <PanelLeftOpen size={16} />
+          </button>
+        )}
+
         {/* 设置操作项 */}
         <button
+          className="zx-nav-item"
           onClick={() => {
             alert('系统设置模块已就绪，当前已接入真实服务端环境');
           }}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '10px',
-            width: '100%',
-            padding: '8px 12px',
-            borderRadius: 'var(--radius-md)',
-            color: 'var(--text-secondary)',
-            fontSize: 'var(--font-size-sm)',
-            marginBottom: '8px',
-            transition: 'background-color 120ms ease',
-          }}
-          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#EFEFEF')}
-          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+          title={collapsed ? '设置' : undefined}
+          style={{ fontSize: 'var(--font-size-sm)', marginBottom: '8px' }}
         >
           <Settings size={16} />
-          <span>设置</span>
+          {!collapsed && <span>设置</span>}
         </button>
-
-        {/* 细分割线 */}
-        <div style={{ height: '1px', backgroundColor: 'var(--border-color)', margin: '4px 0 10px 0' }} />
 
         {/* 用户头像与信息条 */}
         <div
           onClick={() => setShowUserMenu(!showUserMenu)}
+          title={collapsed ? `${user?.display_name || ''} · ${roleLabel}` : undefined}
           style={{
             display: 'flex',
             alignItems: 'center',
-            justifyContent: 'space-between',
-            padding: '8px',
-            borderRadius: 'var(--radius-md)',
+            justifyContent: collapsed ? 'center' : 'space-between',
+            width: '100%',
+            padding: collapsed ? '12px 0 2px' : '12px 8px 2px',
+            borderTop: '1px solid var(--border-color)',
             cursor: 'pointer',
-            backgroundColor: showUserMenu ? 'var(--bg-selected)' : 'transparent',
-            transition: 'background-color 120ms ease',
-          }}
-          onMouseEnter={(e) => {
-            if (!showUserMenu) e.currentTarget.style.backgroundColor = '#EFEFEF';
-          }}
-          onMouseLeave={(e) => {
-            if (!showUserMenu) e.currentTarget.style.backgroundColor = 'transparent';
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
             {/* 圆形头像 */}
             <div
               style={{
-                width: '32px',
-                height: '32px',
+                width: '30px',
+                height: '30px',
                 borderRadius: '50%',
-                backgroundColor: '#D9DFDB',
-                color: 'var(--text-primary)',
+                backgroundColor: 'var(--brand-100)',
+                color: 'var(--brand-700)',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                fontSize: '14px',
+                fontSize: '13px',
                 fontWeight: 600,
                 flexShrink: 0,
+                boxShadow: showUserMenu ? '0 0 0 2px var(--brand-200)' : 'none',
+                transition: 'box-shadow 140ms ease',
               }}
             >
               {avatarChar}
             </div>
 
             {/* 用户昵称与角色 */}
-            <div style={{ minWidth: 0 }}>
-              <div
-                style={{
-                  fontSize: 'var(--font-size-base)',
-                  fontWeight: 600,
-                  color: 'var(--text-primary)',
-                  whiteSpace: 'nowrap',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  lineHeight: 1.2,
-                }}
-                title={user?.display_name}
-              >
-                {user?.display_name || '未登录'}
+            {!collapsed && (
+              <div style={{ minWidth: 0 }}>
+                <div
+                  style={{
+                    fontSize: 'var(--font-size-sm)',
+                    fontWeight: 600,
+                    color: 'var(--text-primary)',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    lineHeight: 1.3,
+                  }}
+                  title={user?.display_name}
+                >
+                  {user?.display_name || '未登录'}
+                </div>
+                <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)', marginTop: '1px' }}>
+                  {roleLabel}
+                </div>
               </div>
-              <div
-                style={{
-                  fontSize: 'var(--font-size-xs)',
-                  color: 'var(--text-secondary)',
-                  marginTop: '2px',
-                }}
-              >
-                {roleLabel}
-              </div>
-            </div>
+            )}
           </div>
 
-          <ChevronDown size={15} color="var(--text-secondary)" />
+          {!collapsed && <ChevronsUpDown size={14} color="var(--text-muted)" />}
         </div>
 
         {/* 用户弹层菜单 (含企业信息、退出登录) */}
@@ -235,34 +223,27 @@ export const GlobalSidebar: React.FC<GlobalSidebarProps> = ({ currentNav, onSele
           <div
             style={{
               position: 'absolute',
-              bottom: '56px',
-              left: '4px',
-              right: '4px',
-              backgroundColor: '#FFFFFF',
-              border: '1px solid var(--border-color)',
-              borderRadius: 'var(--radius-lg)',
-              boxShadow: '0 4px 16px rgba(0, 0, 0, 0.08)',
-              padding: '8px',
+              bottom: '52px',
+              left: 0,
+              width: '208px',
+              backgroundColor: 'var(--bg-primary)',
+              borderRadius: 'var(--radius-md)',
+              boxShadow: 'var(--shadow-lg)',
+              padding: '6px',
               zIndex: 200,
             }}
           >
-            <div
-              style={{
-                padding: '6px 8px',
-                borderBottom: '1px solid var(--border-color)',
-                marginBottom: '4px',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: 'var(--text-muted)' }}>
+            <div style={{ padding: '8px 10px', borderBottom: '1px solid var(--border-color)', marginBottom: '4px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)' }}>
                 <Building size={12} />
                 <span>当前所属企业</span>
               </div>
               <div
                 style={{
-                  fontSize: '12px',
+                  fontSize: 'var(--font-size-sm)',
                   fontWeight: 500,
                   color: 'var(--text-primary)',
-                  marginTop: '2px',
+                  marginTop: '4px',
                   whiteSpace: 'nowrap',
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
@@ -274,23 +255,12 @@ export const GlobalSidebar: React.FC<GlobalSidebarProps> = ({ currentNav, onSele
             </div>
 
             <button
+              className="btn-danger-ghost"
               onClick={() => {
                 setShowUserMenu(false);
                 logout();
               }}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '8px',
-                width: '100%',
-                padding: '8px 10px',
-                borderRadius: 'var(--radius-sm)',
-                color: 'var(--error-text)',
-                fontSize: 'var(--font-size-sm)',
-                textAlign: 'left',
-              }}
-              onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = 'var(--error-bg)')}
-              onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+              style={{ width: '100%', justifyContent: 'flex-start' }}
             >
               <LogOut size={15} />
               <span>退出登录</span>

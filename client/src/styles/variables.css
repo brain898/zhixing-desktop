@@ -1,43 +1,82 @@
 :root {
-  /* 基础与背景颜色 (视觉方案第 4 节规范) */
+  /* 品牌墨绿色阶 */
+  --brand-50: #F1F6F3;
+  --brand-100: #E3EDE7;
+  --brand-200: #C5D9CE;
+  --brand-300: #9DBFAD;
+  --brand-500: #3D7A62;
+  --brand-600: #285C49;
+  --brand-700: #204B3C;
+  --brand-800: #17382D;
+
+  /* 表面与背景：canvas 为应用底色，primary 为浮起的内容面 */
   --bg-primary: #FFFFFF;
-  --bg-secondary: #F7F8F7;
-  --bg-selected: #EAF1ED;
-  --bg-neutral-tag: #F0F2F1;
-  --border-color: #E6E8E7;
+  --bg-secondary: #F6F7F6;
+  --bg-tertiary: #F1F3F2;
+  --bg-sunken: #F1F3F2;
+  --bg-hover: #ECEFED;
+  --bg-selected: var(--brand-50);
+  --bg-neutral-tag: #F1F3F2;
+  --border-color: #E4E7E5;
+  --border-strong: #D3D8D5;
 
-  /* 文字颜色 */
-  --text-primary: #202522;
-  --text-secondary: #66706A;
-  --text-muted: #9AA39E;
+  /* 文字 */
+  --text-primary: #1B211E;
+  --text-secondary: #5B665F;
+  --text-muted: #8C968F;
 
-  /* 品牌与强调色 */
-  --brand-accent: #285C49;
-  --brand-hover: #204B3C;
-  --brand-active: #17382D;
+  /* 品牌强调（兼容旧命名） */
+  --brand-accent: var(--brand-600);
+  --brand-hover: var(--brand-700);
+  --brand-active: var(--brand-800);
+  --brand-accent-light: var(--brand-50);
 
-  /* 状态与告警颜色 */
-  --pending-text: #8A570F;
-  --pending-bg: #FFF3E0;
-  --success-text: #285C49;
-  --success-bg: #EAF1ED;
-  --error-text: #B42318;
-  --error-bg: #FEF3F2;
+  /* 语义色：每种有 text / bg / border；info 不再使用蓝色 */
+  --success-text: var(--brand-600);
+  --success-bg: var(--brand-50);
+  --success-border: var(--brand-200);
+  --warning-text: #9A5B0B;
+  --warning-bg: #FDF4E3;
+  --warning-border: #F2DDB3;
+  --pending-text: var(--warning-text);
+  --pending-bg: var(--warning-bg);
+  --danger-text: #B42318;
+  --danger-bg: #FDF1F0;
+  --danger-border: #F5CFCB;
+  --error-text: var(--danger-text);
+  --error-bg: var(--danger-bg);
+  --info-text: var(--brand-700);
+  --info-bg: var(--brand-50);
+  --info-border: var(--brand-200);
+  --highlight-bg: #FBEFC9;
 
-  /* 字体栈 (视觉方案第 5 节规范) */
-  --font-family-base: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-  --font-size-title: 22px;
+  /* 阴影：以阴影与留白分层，减少描边 */
+  --shadow-sm: 0 1px 2px rgba(20, 32, 26, 0.05);
+  --shadow-md: 0 2px 8px rgba(20, 32, 26, 0.06), 0 1px 2px rgba(20, 32, 26, 0.04);
+  --shadow-hover: 0 4px 16px rgba(20, 32, 26, 0.10);
+  --shadow-lg: 0 16px 48px rgba(20, 32, 26, 0.16), 0 2px 8px rgba(20, 32, 26, 0.06);
+
+  /* 字体与字号（最小 12px） */
+  --font-family-base: "Microsoft YaHei UI", "Segoe UI Variable", "Noto Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  --font-size-title: 20px;
   --font-size-section: 16px;
+  --font-size-md: 15px;
   --font-size-base: 14px;
   --font-size-sm: 13px;
   --font-size-xs: 12px;
 
-  /* 尺寸与圆角 (视觉方案第 3.1 & 5 节规范) */
+  /* 尺寸与圆角 */
   --header-height: 34px;
-  --sidebar-width: 216px;
-  --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 8px;
+  --topbar-height: 52px;
+  --sidebar-width: 200px;
+  --sidebar-rail-width: 56px;
+  --control-sm: 28px;
+  --control-md: 32px;
+  --control-lg: 36px;
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
 
   /* 间距体系 */
   --space-xs: 4px;

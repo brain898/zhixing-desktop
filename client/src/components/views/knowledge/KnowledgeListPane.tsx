@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Search,
   CheckCircle2,
@@ -7,7 +7,6 @@ import {
   FileText,
   BookOpen,
   X,
-  Sparkles,
   ArrowRight,
   RotateCw,
   AlertCircle,
@@ -21,36 +20,90 @@ import {
   PrimaryCategory,
   DocumentItem,
   SearchKnowledgeResultItem,
+  SourceLocator,
 } from '../../../types';
 import { api } from '../../../services/api';
 import { ProofreadingModal } from './ProofreadingModal';
+import { SearchResultDetailModal } from './SearchResultDetailModal';
+import { AppConfirmDialog } from '../../common/AppConfirmDialog';
+import { formatAnchor, formatVersionLabel } from '../../../utils/formatters';
 
 interface KnowledgeListPaneProps {
   selectedDoc: DocumentItem | null;
+  refreshKey?: number;
   onClearDocSelection: () => void;
   onOpenDocPreview: (tab?: 'preview' | 'pipeline') => void;
+  onOpenSearchSource: (documentId: string, versionId: string, locator: SourceLocator | null) => void;
 }
 
-const CATEGORY_STYLES: Record<string, { bg: string; text: string; border: string }> = {
-  制度与标准: { bg: '#EBF4F0', text: '#285C49', border: '#C2DBD0' },
-  方法与工具: { bg: '#EBF8FF', text: '#2B6CB0', border: '#BEE3F8' },
-  项目案例: { bg: '#FAF5FF', text: '#6B46C1', border: '#E9D8FD' },
-  指标数据: { bg: '#FFFAF0', text: '#C05621', border: '#FEEBC8' },
-  专家经验: { bg: '#F0FFF4', text: '#22543D', border: '#C6F6D5' },
+import { CATEGORY_STYLES } from './knowledgeShared';
+import { SegmentedTabs } from '../../ui/SegmentedTabs';
+
+const sortItemsWithDisabledLast = (itemList: KnowledgeItem[]): KnowledgeItem[] => {
+  return [...itemList].sort((a, b) => {
+    const aDisabled = a.lifecycle_status === 'disabled' ? 1 : 0;
+    const bDisabled = b.lifecycle_status === 'disabled' ? 1 : 0;
+    return aDisabled - bDisabled;
+  });
 };
+
+type FormalSearchStatus = 'idle' | 'loading' | 'results' | 'empty' | 'error';
+
+interface FormalSearchSnapshot {
+  q: string;
+  document_id?: string;
+  category: string[];
+  customer_type: string[];
+  business_scene: string[];
+  problem_tag: string[];
+}
 
 export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
   selectedDoc,
+  refreshKey = 0,
   onClearDocSelection,
   onOpenDocPreview,
+  onOpenSearchSource,
 }) => {
   const [items, setItems] = useState<KnowledgeItem[]>([]);
   const [stats, setStats] = useState<KnowledgeStats | null>(null);
   const [loading, setLoading] = useState(true);
+  const [listError, setListError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [activeSearchTerm, setActiveSearchTerm] = useState('');
   const [searchResults, setSearchResults] = useState<SearchKnowledgeResultItem[]>([]);
-  const [isSearching, setIsSearching] = useState(false);
+  const [formalSearchStatus, setFormalSearchStatus] = useState<FormalSearchStatus>('idle');
+  const [formalSearchError, setFormalSearchError] = useState<string | null>(null);
+  const [lastSearchSnapshot, setLastSearchSnapshot] = useState<FormalSearchSnapshot | null>(null);
+  const [activeSearchResult, setActiveSearchResult] = useState<SearchKnowledgeResultItem | null>(null);
+  const searchAbortRef = useRef<AbortController | null>(null);
+  const searchRequestSequenceRef = useRef(0);
+  const knowledgeAbortRef = useRef<AbortController | null>(null);
+  const knowledgeRequestSequenceRef = useRef(0);
+  const lastRenderedDocIdRef = useRef<string | undefined>(selectedDoc?.id);
+
+  const [lifecycleConfirmState, setLifecycleConfirmState] = useState<{
+    isOpen: boolean;
+    item: KnowledgeItem | null;
+    targetStatus: 'active' | 'disabled';
+    loading: boolean;
+  }>({
+    isOpen: false,
+    item: null,
+    targetStatus: 'disabled',
+    loading: false,
+  });
+
+  const [showSearchFilterDrawer, setShowSearchFilterDrawer] = useState(false);
+  const [formalCategories, setFormalCategories] = useState<string[]>([]);
+  const [formalCustomerTypes, setFormalCustomerTypes] = useState<string[]>([]);
+  const [formalBusinessScenes, setFormalBusinessScenes] = useState<string[]>([]);
+  const [formalProblemTags, setFormalProblemTags] = useState<string[]>([]);
+  const [tagOptions, setTagOptions] = useState({
+    customer_types: [] as string[],
+    business_scenes: [] as string[],
+    problem_tags: [] as string[],
+  });
 
   // 一级状态筛选：'all' | 'pending' | 'confirmed'
   const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'confirmed'>('all');
@@ -64,9 +117,18 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
   // 当前核对弹窗对应的条目 ID
   const [activeItemId, setActiveItemId] = useState<string | null>(null);
 
-  const fetchKnowledgeData = async () => {
-    try {
+  const fetchKnowledgeData = async (isSilentBackground = false) => {
+    knowledgeAbortRef.current?.abort();
+    const controller = new AbortController();
+    knowledgeAbortRef.current = controller;
+    const requestSeq = ++knowledgeRequestSequenceRef.current;
+
+    if (!isSilentBackground) {
       setLoading(true);
+      setListError(null);
+    }
+
+    try {
       const docId = selectedDoc ? selectedDoc.id : undefined;
 
       const categoryParam =
@@ -86,183 +148,289 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
       const lifecycleParam =
         lifecycleFilter === 'all' ? undefined : lifecycleFilter;
 
-      const res = await api.getKnowledgeItems({
-        document_id: docId,
-        category: categoryParam,
-        review_status: reviewStatusParam,
-        lifecycle_status: lifecycleParam,
-        search: searchQuery.trim() || undefined,
-      });
+      const res = await api.getKnowledgeItems(
+        {
+          document_id: docId,
+          category: categoryParam,
+          review_status: reviewStatusParam,
+          lifecycle_status: lifecycleParam,
+        },
+        controller.signal
+      );
 
-      setItems(res.items);
+      if (requestSeq !== knowledgeRequestSequenceRef.current) return;
+      setItems(sortItemsWithDisabledLast(res.items));
       setStats(res.stats);
-    } catch (err) {
+      setListError(null);
+      lastRenderedDocIdRef.current = docId;
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || requestSeq !== knowledgeRequestSequenceRef.current) return;
       console.error('Failed to load knowledge items:', err);
+      setListError(err?.message || '加载知识条目失败');
     } finally {
-      setLoading(false);
+      if (requestSeq === knowledgeRequestSequenceRef.current) {
+        setLoading(false);
+      }
     }
   };
+
+  const currentDocId = selectedDoc?.id;
+  const currentDocStatus = selectedDoc?.processing_status;
+
+  // 切换目标文件时立即重置已有条目，避免旧文件数据在新文件标题下显示或被误操作
+  useEffect(() => {
+    if (lastRenderedDocIdRef.current !== currentDocId) {
+      knowledgeAbortRef.current?.abort();
+      searchAbortRef.current?.abort();
+      setItems([]);
+      setStats(null);
+      setListError(null);
+      lastRenderedDocIdRef.current = currentDocId;
+    }
+  }, [currentDocId]);
 
   useEffect(() => {
     if (!activeSearchTerm) {
-      fetchKnowledgeData();
+      // 若当前已有数据且文件 ID 相同，且只是由于 refreshKey 变化触发，执行平滑后台刷新
+      const isSameDoc = lastRenderedDocIdRef.current === currentDocId;
+      const isSilent = isSameDoc && items.length > 0;
+      fetchKnowledgeData(isSilent);
+    } else {
+      executeFormalSearch();
     }
-  }, [selectedDoc, statusFilter, categoryFilter, lifecycleFilter]);
+  }, [currentDocId, currentDocStatus, statusFilter, categoryFilter, lifecycleFilter, refreshKey]);
 
-  // 执行正式检索
-  const handleExecuteSearch = async () => {
-    const q = searchQuery.trim();
-    if (!q) {
-      handleClearSearch();
+  useEffect(() => {
+    api.getKnowledgeTags()
+      .then(setTagOptions)
+      .catch((err) => console.error('Failed to load knowledge tags:', err));
+    return () => {
+      searchAbortRef.current?.abort();
+      knowledgeAbortRef.current?.abort();
+    };
+  }, []);
+
+  const toggleFormalFilter = (
+    value: string,
+    selected: string[],
+    setter: React.Dispatch<React.SetStateAction<string[]>>
+  ) => {
+    setter(selected.includes(value) ? selected.filter((item) => item !== value) : [...selected, value]);
+  };
+
+  const buildSearchSnapshot = (): FormalSearchSnapshot => ({
+    q: searchQuery.trim(),
+    document_id: selectedDoc?.id,
+    category: [...formalCategories],
+    customer_type: [...formalCustomerTypes],
+    business_scene: [...formalBusinessScenes],
+    problem_tag: [...formalProblemTags],
+  });
+
+  const executeFormalSearch = async (snapshotOverride?: FormalSearchSnapshot | null) => {
+    const snapshot = snapshotOverride || buildSearchSnapshot();
+    if (!snapshot.q) {
+      if (activeSearchTerm) handleClearSearch();
       return;
     }
+
+    searchAbortRef.current?.abort();
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
+    const requestSequence = ++searchRequestSequenceRef.current;
+
+    setActiveSearchTerm(snapshot.q);
+    setLastSearchSnapshot(snapshot);
+    setFormalSearchStatus('loading');
+    setFormalSearchError(null);
+    setSearchResults([]);
+
     try {
-      setIsSearching(true);
-      setActiveSearchTerm(q);
-      const res = await api.searchKnowledge({ q, document_id: selectedDoc?.id });
-      setSearchResults(res.items || []);
+      const res = await api.searchKnowledge(snapshot, controller.signal);
+      if (requestSequence !== searchRequestSequenceRef.current) return;
+      const results = res.items || [];
+      setSearchResults(results);
+      setFormalSearchStatus(results.length > 0 ? 'results' : 'empty');
     } catch (err: any) {
-      console.error('Search failed:', err);
-      alert(`检索失败: ${err.message}`);
-    } finally {
-      setIsSearching(false);
+      if (err?.name === 'AbortError' || requestSequence !== searchRequestSequenceRef.current) return;
+      console.error('Formal search failed:', err);
+      setFormalSearchError(err?.message || '检索失败');
+      setFormalSearchStatus('error');
     }
   };
 
-  // 清除检索，返回维护列表
+  const handleExecuteSearch = () => {
+    void executeFormalSearch();
+  };
+
+  const handleRetrySearch = () => {
+    if (lastSearchSnapshot) void executeFormalSearch(lastSearchSnapshot);
+  };
+
+  // 清除正式查询，仅退出正式检索；维护范围与维护筛选保持原样。
   const handleClearSearch = () => {
+    searchAbortRef.current?.abort();
+    searchAbortRef.current = null;
+    searchRequestSequenceRef.current += 1;
     setSearchQuery('');
     setActiveSearchTerm('');
     setSearchResults([]);
+    setFormalSearchStatus('idle');
+    setFormalSearchError(null);
+    setLastSearchSnapshot(null);
+    setActiveSearchResult(null);
     fetchKnowledgeData();
   };
 
-  // 快捷停用/恢复
-  const handleToggleItemLifecycle = async (e: React.MouseEvent, item: KnowledgeItem) => {
+  // 快捷停用/恢复（通过应用内确认弹窗）
+  const handleToggleItemLifecycle = (e: React.MouseEvent, item: KnowledgeItem) => {
     e.stopPropagation();
     const targetStatus = item.lifecycle_status === 'disabled' ? 'active' : 'disabled';
-    const actionText = targetStatus === 'disabled' ? '停用' : '恢复启用';
-    if (
-      !window.confirm(
-        `确认${actionText}知识条目「${item.title}」？${
-          targetStatus === 'disabled'
-            ? '停用后将退出正式检索，不再对外提供服务。'
-            : '恢复后将立即重新恢复正式检索服务。'
-        }`
-      )
-    ) {
-      return;
-    }
+    setLifecycleConfirmState({
+      isOpen: true,
+      item,
+      targetStatus,
+      loading: false,
+    });
+  };
+
+  const handleConfirmLifecycleToggle = async () => {
+    const { item, targetStatus } = lifecycleConfirmState;
+    if (!item) return;
+
+    setLifecycleConfirmState((prev) => ({ ...prev, loading: true }));
     try {
       await api.updateKnowledgeLifecycle(item.id, targetStatus);
+      setItems((prev) => {
+        const nextList = prev.map((it) => (it.id === item.id ? { ...it, lifecycle_status: targetStatus } : it));
+        return sortItemsWithDisabledLast(nextList);
+      });
+      setLifecycleConfirmState({ isOpen: false, item: null, targetStatus: 'disabled', loading: false });
       if (activeSearchTerm) {
         handleExecuteSearch();
       } else {
-        fetchKnowledgeData();
+        fetchKnowledgeData(true);
       }
     } catch (err: any) {
-      alert(`${actionText}失败: ${err.message}`);
+      alert(`${targetStatus === 'disabled' ? '停用' : '恢复启用'}失败: ${err.message}`);
+      setLifecycleConfirmState((prev) => ({ ...prev, loading: false }));
     }
   };
 
-  // 处理流水线「一句结果 + 对应动作」计算
+  const handleCancelLifecycleToggle = () => {
+    if (lifecycleConfirmState.loading) return;
+    setLifecycleConfirmState({ isOpen: false, item: null, targetStatus: 'disabled', loading: false });
+  };
+
+  const handleRetryList = () => {
+    void fetchKnowledgeData(false);
+  };
+
+  // 处理流水线「一句结果 + 对应动作」统一状态条
+  const renderStatusStrip = (
+    tone: 'progress' | 'danger' | 'warning' | 'pending' | 'success',
+    icon: React.ReactNode,
+    text: React.ReactNode,
+    action: React.ReactNode,
+    extra?: React.ReactNode
+  ) => {
+    const toneColor: Record<typeof tone, string> = {
+      progress: 'var(--brand-accent)',
+      danger: 'var(--danger-text)',
+      warning: 'var(--warning-text)',
+      pending: 'var(--warning-text)',
+      success: 'var(--brand-accent)',
+    };
+    return (
+      <div
+        style={{
+          padding: '8px 8px 8px 14px',
+          backgroundColor: tone === 'danger' ? 'var(--danger-bg)' : 'var(--bg-primary)',
+          borderRadius: 'var(--radius-md)',
+          boxShadow: tone === 'danger' ? 'none' : 'var(--shadow-sm)',
+          border: tone === 'danger' ? '1px solid var(--danger-border)' : '1px solid var(--border-color)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '12px',
+          fontSize: 'var(--font-size-sm)',
+          color: 'var(--text-secondary)',
+        }}
+      >
+        <span style={{ display: 'flex', color: toneColor[tone], flexShrink: 0 }}>{icon}</span>
+        <span style={{ color: tone === 'danger' ? 'var(--danger-text)' : 'var(--text-primary)', minWidth: 0 }}>{text}</span>
+        {extra}
+        <span style={{ flex: 1 }} />
+        {action}
+      </div>
+    );
+  };
+
+  const renderPendingProgress = (pending: number, total: number) => {
+    const done = Math.max(total - pending, 0);
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: 'var(--text-muted)', fontSize: 'var(--font-size-xs)' }}>
+        <div className="zx-progress" style={{ width: '160px' }}>
+          <i style={{ width: `${pct}%` }} />
+        </div>
+        <span>
+          已处理 {done} / {total}
+        </span>
+      </div>
+    );
+  };
+
+  const startReviewButton = (
+    <button
+      type="button"
+      className="btn-primary btn-sm"
+      onClick={() => {
+        const firstPending = items.find((i) => i.review_status === 'pending_review') || items[0];
+        if (firstPending) setActiveItemId(firstPending.id);
+      }}
+    >
+      <span>开始核对</span>
+      <ArrowRight size={13} />
+    </button>
+  );
+
   const renderPipelineBanner = () => {
     if (selectedDoc) {
       const status = selectedDoc.processing_status;
 
       if (status === 'parsing' || status === 'extracting' || status === 'queued') {
-        return (
-          <div
-            style={{
-              padding: '10px 16px',
-              backgroundColor: 'var(--brand-accent-light)',
-              border: '1px solid #C2DBD0',
-              borderRadius: 'var(--radius-sm)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              fontSize: '13px',
-              color: 'var(--brand-accent)',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <RotateCw size={14} className="spin-slow" />
-              <span>正在整理资料，可以离开此页面</span>
-            </div>
-            <button
-              type="button"
-              className="btn-secondary"
-              onClick={() => onOpenDocPreview('pipeline')}
-              style={{ height: '26px', fontSize: '11px', padding: '0 10px', gap: '4px' }}
-            >
-              <span>查看进度</span>
-              <ArrowRight size={12} />
-            </button>
-          </div>
+        return renderStatusStrip(
+          'progress',
+          <RotateCw size={15} className="spin-slow" />,
+          '正在整理资料，可以离开此页面',
+          <button type="button" className="btn-ghost btn-sm" onClick={() => onOpenDocPreview('pipeline')}>
+            <span>查看进度</span>
+            <ArrowRight size={13} />
+          </button>
         );
       }
 
       if (status === 'failed') {
-        return (
-          <div
-            style={{
-              padding: '10px 16px',
-              backgroundColor: '#FEF2F2',
-              border: '1px solid #FECACA',
-              borderRadius: 'var(--radius-sm)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              fontSize: '13px',
-              color: '#B91C1C',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <AlertCircle size={15} />
-              <span>文件已保存，但未能生成知识</span>
-            </div>
-            <button
-              type="button"
-              className="btn-secondary"
-              onClick={() => onOpenDocPreview('pipeline')}
-              style={{ height: '26px', fontSize: '11px', padding: '0 10px', gap: '4px' }}
-            >
-              <span>查看原因与重试</span>
-              <ArrowRight size={12} />
-            </button>
-          </div>
+        return renderStatusStrip(
+          'danger',
+          <AlertCircle size={15} />,
+          '文件已保存，但未能生成知识',
+          <button type="button" className="btn-secondary btn-sm" onClick={() => onOpenDocPreview('pipeline')}>
+            <span>查看原因与重试</span>
+            <ArrowRight size={13} />
+          </button>
         );
       }
 
       if (status === 'partial_failed') {
-        return (
-          <div
-            style={{
-              padding: '10px 16px',
-              backgroundColor: '#FFFBEB',
-              border: '1px solid #FDE68A',
-              borderRadius: 'var(--radius-sm)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              fontSize: '13px',
-              color: '#B45309',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <AlertTriangle size={15} />
-              <span>部分内容未能处理</span>
-            </div>
-            <button
-              type="button"
-              className="btn-secondary"
-              onClick={() => onOpenDocPreview('pipeline')}
-              style={{ height: '26px', fontSize: '11px', padding: '0 10px', gap: '4px' }}
-            >
-              <span>查看未处理内容</span>
-              <ArrowRight size={12} />
-            </button>
-          </div>
+        return renderStatusStrip(
+          'warning',
+          <AlertTriangle size={15} />,
+          '部分内容未能处理',
+          <button type="button" className="btn-ghost btn-sm" onClick={() => onOpenDocPreview('pipeline')}>
+            <span>查看未处理内容</span>
+            <ArrowRight size={13} />
+          </button>
         );
       }
 
@@ -271,108 +439,42 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
         const confirmedCount = stats?.confirmed_count || 0;
 
         if (pendingCount > 0) {
-          return (
-            <div
-              style={{
-                padding: '10px 16px',
-                backgroundColor: '#EFF6FF',
-                border: '1px solid #BFDBFE',
-                borderRadius: 'var(--radius-sm)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                fontSize: '13px',
-                color: '#1D4ED8',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <Clock size={15} />
-                <span>整理完成，有 {pendingCount} 条知识待核对</span>
-              </div>
-              <button
-                type="button"
-                className="btn-primary"
-                onClick={() => {
-                  const firstPending = items.find((i) => i.review_status === 'pending_review') || items[0];
-                  if (firstPending) setActiveItemId(firstPending.id);
-                }}
-                style={{ height: '26px', fontSize: '11px', padding: '0 12px', gap: '4px' }}
-              >
-                <span>开始核对</span>
-                <ArrowRight size={12} />
-              </button>
-            </div>
+          return renderStatusStrip(
+            'pending',
+            <Clock size={15} />,
+            <>整理完成，有 {pendingCount} 条知识待核对</>,
+            startReviewButton,
+            renderPendingProgress(pendingCount, stats?.total || 0)
           );
         }
 
         if (confirmedCount > 0) {
-          return (
-            <div
-              style={{
-                padding: '10px 16px',
-                backgroundColor: '#ECFDF5',
-                border: '1px solid #A7F3D0',
-                borderRadius: 'var(--radius-sm)',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                fontSize: '13px',
-                color: '#047857',
+          return renderStatusStrip(
+            'success',
+            <CheckCircle2 size={15} />,
+            <>已有 {confirmedCount} 条可用知识</>,
+            <button
+              type="button"
+              className="btn-ghost btn-sm"
+              onClick={() => {
+                setStatusFilter('confirmed');
+                setCategoryFilter('all');
               }}
             >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <CheckCircle2 size={15} />
-                <span>已有 {confirmedCount} 条可用知识</span>
-              </div>
-              <button
-                type="button"
-                className="btn-secondary"
-                onClick={() => {
-                  setStatusFilter('confirmed');
-                  setCategoryFilter('all');
-                }}
-                style={{ height: '26px', fontSize: '11px', padding: '0 10px', gap: '4px' }}
-              >
-                <span>查看可用知识</span>
-                <ArrowRight size={12} />
-              </button>
-            </div>
+              <span>查看可用知识</span>
+              <ArrowRight size={13} />
+            </button>
           );
         }
       }
     } else if (stats && stats.pending_review_count > 0) {
       // 全部资料视图下存在待核对条目
-      return (
-        <div
-          style={{
-            padding: '10px 16px',
-            backgroundColor: '#EFF6FF',
-            border: '1px solid #BFDBFE',
-            borderRadius: 'var(--radius-sm)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            fontSize: '13px',
-            color: '#1D4ED8',
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <Clock size={15} />
-            <span>全库整理完成，共有 {stats.pending_review_count} 条知识待核对</span>
-          </div>
-          <button
-            type="button"
-            className="btn-primary"
-            onClick={() => {
-              const firstPending = items.find((i) => i.review_status === 'pending_review') || items[0];
-              if (firstPending) setActiveItemId(firstPending.id);
-            }}
-            style={{ height: '26px', fontSize: '11px', padding: '0 12px', gap: '4px' }}
-          >
-            <span>开始核对</span>
-            <ArrowRight size={12} />
-          </button>
-        </div>
+      return renderStatusStrip(
+        'pending',
+        <Clock size={15} />,
+        <>全库整理完成，共有 {stats.pending_review_count} 条知识待核对</>,
+        startReviewButton,
+        renderPendingProgress(stats.pending_review_count, stats.total || 0)
       );
     }
 
@@ -382,246 +484,206 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
   const handleClearFilters = () => {
     setStatusFilter('all');
     setCategoryFilter('all');
-    setSearchQuery('');
+    setLifecycleFilter('all');
   };
 
+  const clearFormalFilters = () => {
+    setFormalCategories([]);
+    setFormalCustomerTypes([]);
+    setFormalBusinessScenes([]);
+    setFormalProblemTags([]);
+  };
+
+  const formalFilterCount =
+    formalCategories.length +
+    formalCustomerTypes.length +
+    formalBusinessScenes.length +
+    formalProblemTags.length;
+
+  const getResultLocator = (result: SearchKnowledgeResultItem): SourceLocator | null => {
+    const matchedEvidenceIds = new Set(
+      (result.matched_fragments || []).flatMap((fragment) => fragment.evidence_ids || [])
+    );
+    const matchedEvidence = (result.evidence || []).find((item) => matchedEvidenceIds.has(item.id));
+    return matchedEvidence?.source_locator || result.evidence?.[0]?.source_locator || null;
+  };
+
+  const describeResultLocator = (result: SearchKnowledgeResultItem): string => {
+    const locator = getResultLocator(result);
+    if (!locator) return '来源位置';
+    if (locator.page_number !== null) {
+      return `第 ${locator.page_number} 页${locator.heading_path ? ` · ${locator.heading_path}` : ''}`;
+    }
+    if (locator.heading_path && locator.paragraph_anchor) {
+      return `${locator.heading_path} · ${formatAnchor(locator.paragraph_anchor)}`;
+    }
+    if (locator.paragraph_anchor) return formatAnchor(locator.paragraph_anchor);
+    if (locator.heading_path) return locator.heading_path;
+    return locator.block_index !== null ? `第 ${locator.block_index} 个结构块` : '来源位置';
+  };
+
+  const renderFormalFilterRow = (
+    label: string,
+    options: string[],
+    selected: string[],
+    setter: React.Dispatch<React.SetStateAction<string[]>>
+  ) => (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+      <span style={{ color: 'var(--text-muted)', width: '68px', flexShrink: 0 }}>{label}</span>
+      <button type="button" onClick={() => setter([])} style={filterChipStyle(selected.length === 0)}>
+        全部
+      </button>
+      {options.map((option) => {
+        const isSelected = selected.includes(option);
+        return (
+          <button
+            key={option}
+            type="button"
+            onClick={() => toggleFormalFilter(option, selected, setter)}
+            style={filterChipStyle(isSelected)}
+          >
+            {option}
+          </button>
+        );
+      })}
+    </div>
+  );
+
+
+  const hasSecondaryFilter = (categoryFilter !== 'all' && categoryFilter !== 'unclassified') || lifecycleFilter !== 'all';
+
+  const filterChipStyle = (active: boolean): React.CSSProperties => ({
+    height: '26px',
+    padding: '0 10px',
+    borderRadius: '13px',
+    border: '1px solid transparent',
+    backgroundColor: active ? 'var(--brand-600)' : 'var(--bg-primary)',
+    color: active ? '#FFFFFF' : 'var(--text-secondary)',
+    boxShadow: active ? 'none' : 'inset 0 0 0 1px var(--border-color)',
+    cursor: 'pointer',
+    fontSize: 'var(--font-size-xs)',
+    fontWeight: active ? 500 : 400,
+    whiteSpace: 'nowrap',
+  });
+
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0, backgroundColor: '#FFFFFF' }}>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0, backgroundColor: 'var(--bg-secondary)' }}>
       {/* 顶部控制栏 */}
       <div
         style={{
-          padding: '16px 24px',
-          borderBottom: '1px solid var(--border-color)',
+          padding: '14px 24px 4px',
           display: 'flex',
           flexDirection: 'column',
           gap: '12px',
-          backgroundColor: '#FFFFFF',
         }}
       >
-        {/* 第一行：当前资料名称或查询范围 + 查看原文入口 */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <span style={{ fontSize: '14px', fontWeight: 600, color: 'var(--text-primary)' }}>
-              {selectedDoc ? (
-                <>
-                  资料：<strong style={{ color: 'var(--brand-accent)' }}>{selectedDoc.title}</strong>
-                </>
-              ) : (
-                <>范围：全部资料 ({stats?.total || 0} 条知识)</>
-              )}
-            </span>
+        {/* 第一行：维护浏览与正式检索使用互斥的状态控制 + 检索框 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+          {!activeSearchTerm ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+              {/* 一级状态筛选：全部 / 待核对 / 已确认 */}
+              <SegmentedTabs
+                value={statusFilter}
+                onChange={(key) => setStatusFilter(key)}
+                options={[
+                  { key: 'all', label: '全部', count: stats?.total || 0, testId: 'status-all' },
+                  { key: 'pending', label: '待核对', count: stats?.pending_review_count || 0, testId: 'status-pending' },
+                  { key: 'confirmed', label: '已确认', count: stats?.confirmed_count || 0, testId: 'status-confirmed' },
+                ]}
+              />
 
-            {selectedDoc && (
-              <button
-                type="button"
-                className="btn-secondary"
-                onClick={onClearDocSelection}
-                style={{ height: '24px', fontSize: '11px', padding: '0 8px', gap: '2px' }}
-                title="清除单文件筛选，汇总查看全部资料"
-              >
-                <X size={12} />
-                <span>查看全部资料</span>
-              </button>
-            )}
-          </div>
-
-          {/* 独立原文与处理详情入口 */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            {selectedDoc && (
-              <button
-                type="button"
-                className="btn-secondary"
-                onClick={() => onOpenDocPreview('preview')}
-                style={{ height: '28px', fontSize: '12px', gap: '4px' }}
-                title="查看该文件的原文预览与段落锚点"
-              >
-                <Eye size={13} />
-                <span>查看原文</span>
-              </button>
-            )}
-            {selectedDoc && (
-              <button
-                type="button"
-                className="btn-secondary"
-                onClick={() => onOpenDocPreview('pipeline')}
-                style={{ height: '28px', fontSize: '12px', gap: '4px' }}
-                title="查看结构块拆解、任务耗时与技术信息"
-              >
-                <FileText size={13} />
-                <span>处理详情</span>
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* 第二行：流水线一句结果与动作条 */}
-        {renderPipelineBanner()}
-
-        {/* 第三行：一级状态筛选 + 未分类待办入口 + 折叠筛选按钮 + 检索输入框 */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-            {/* 一级状态筛选：全部 / 待核对 / 已确认 */}
-            <div
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                backgroundColor: 'var(--bg-secondary)',
-                padding: '2px',
-                borderRadius: 'var(--radius-sm)',
-                border: '1px solid var(--border-color)',
-              }}
-            >
-              <button
-                type="button"
-                data-testid="status-all"
-                onClick={() => setStatusFilter('all')}
-                style={{
-                  padding: '4px 10px',
-                  fontSize: '12px',
-                  fontWeight: statusFilter === 'all' ? 600 : 400,
-                  border: 'none',
-                  borderRadius: 'var(--radius-xs)',
-                  backgroundColor: statusFilter === 'all' ? '#FFFFFF' : 'transparent',
-                  color: statusFilter === 'all' ? 'var(--text-primary)' : 'var(--text-secondary)',
-                  boxShadow: statusFilter === 'all' ? '0 1px 2px rgba(0,0,0,0.05)' : 'none',
-                  cursor: 'pointer',
-                }}
-              >
-                全部 ({stats?.total || 0})
-              </button>
-              <button
-                type="button"
-                data-testid="status-pending"
-                onClick={() => setStatusFilter('pending')}
-                style={{
-                  padding: '4px 10px',
-                  fontSize: '12px',
-                  fontWeight: statusFilter === 'pending' ? 600 : 400,
-                  border: 'none',
-                  borderRadius: 'var(--radius-xs)',
-                  backgroundColor: statusFilter === 'pending' ? '#EFF6FF' : 'transparent',
-                  color: statusFilter === 'pending' ? '#1D4ED8' : 'var(--text-secondary)',
-                  boxShadow: statusFilter === 'pending' ? '0 1px 2px rgba(0,0,0,0.05)' : 'none',
-                  cursor: 'pointer',
-                }}
-              >
-                待核对 ({stats?.pending_review_count || 0})
-              </button>
-              <button
-                type="button"
-                data-testid="status-confirmed"
-                onClick={() => setStatusFilter('confirmed')}
-                style={{
-                  padding: '4px 10px',
-                  fontSize: '12px',
-                  fontWeight: statusFilter === 'confirmed' ? 600 : 400,
-                  border: 'none',
-                  borderRadius: 'var(--radius-xs)',
-                  backgroundColor: statusFilter === 'confirmed' ? '#ECFDF5' : 'transparent',
-                  color: statusFilter === 'confirmed' ? '#047857' : 'var(--text-secondary)',
-                  boxShadow: statusFilter === 'confirmed' ? '0 1px 2px rgba(0,0,0,0.05)' : 'none',
-                  cursor: 'pointer',
-                }}
-              >
-                已确认 ({stats?.confirmed_count || 0})
-              </button>
-            </div>
-
-            {/* 若未分类数 > 0，展示独立「需要分类 X 条」快捷待办按钮 */}
-            {(stats?.unclassified_count || 0) > 0 && (
-              <button
-                type="button"
-                data-testid="tab-unclassified"
-                onClick={() => setCategoryFilter(categoryFilter === 'unclassified' ? 'all' : 'unclassified')}
-                title="待分类条目必须由人工核对并指定五类主分类之一方可启用"
-                style={{
-                  height: '28px',
-                  padding: '0 10px',
-                  fontSize: '12px',
-                  fontWeight: 600,
-                  borderRadius: 'var(--radius-sm)',
-                  border: categoryFilter === 'unclassified' ? '1px solid #D97706' : '1px solid #FCD34D',
-                  backgroundColor: categoryFilter === 'unclassified' ? '#FEF3C7' : '#FFFBEB',
-                  color: '#B45309',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '4px',
-                }}
-              >
-                <AlertTriangle size={13} />
-                <span>需要分类 {stats?.unclassified_count} 条</span>
-              </button>
-            )}
-
-            {/* 筛选面板展开/折叠按钮 */}
-            <button
-              type="button"
-              data-testid="toggle-filters-btn"
-              onClick={() => setShowFilterDrawer(!showFilterDrawer)}
-              style={{
-                height: '28px',
-                padding: '0 10px',
-                fontSize: '12px',
-                fontWeight: (categoryFilter !== 'all' && categoryFilter !== 'unclassified') || lifecycleFilter !== 'all' ? 600 : 400,
-                borderRadius: 'var(--radius-sm)',
-                border: '1px solid var(--border-color)',
-                backgroundColor: showFilterDrawer || (categoryFilter !== 'all' && categoryFilter !== 'unclassified') || lifecycleFilter !== 'all'
-                  ? 'var(--bg-secondary)'
-                  : '#FFFFFF',
-                color: (categoryFilter !== 'all' && categoryFilter !== 'unclassified') || lifecycleFilter !== 'all'
-                  ? 'var(--brand-accent)'
-                  : 'var(--text-secondary)',
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '4px',
-              }}
-            >
-              <Filter size={13} />
-              <span>筛选</span>
-              {((categoryFilter !== 'all' && categoryFilter !== 'unclassified' ? 1 : 0) + (lifecycleFilter !== 'all' ? 1 : 0)) > 0 && (
-                <span
+              {/* 若未分类数 > 0，展示独立「需要分类 X 条」快捷待办按钮 */}
+              {(stats?.unclassified_count || 0) > 0 && (
+                <button
+                  type="button"
+                  data-testid="tab-unclassified"
+                  className="zx-pill warning"
+                  onClick={() => setCategoryFilter(categoryFilter === 'unclassified' ? 'all' : 'unclassified')}
+                  title="待分类条目必须由人工核对并指定五类主分类之一方可启用"
                   style={{
-                    backgroundColor: 'var(--brand-accent)',
-                    color: '#FFFFFF',
-                    borderRadius: '10px',
-                    padding: '0 5px',
-                    fontSize: '10px',
-                    lineHeight: '14px',
+                    cursor: 'pointer',
+                    boxShadow: categoryFilter === 'unclassified' ? 'inset 0 0 0 1px var(--warning-text)' : 'none',
                   }}
                 >
-                  {(categoryFilter !== 'all' && categoryFilter !== 'unclassified' ? 1 : 0) + (lifecycleFilter !== 'all' ? 1 : 0)}
-                </span>
+                  <AlertTriangle size={13} />
+                  <span>需要分类 {stats?.unclassified_count} 条</span>
+                </button>
               )}
-            </button>
-          </div>
+
+              {/* 筛选面板展开/折叠按钮 */}
+              <button
+                type="button"
+                data-testid="toggle-filters-btn"
+                className="btn-ghost"
+                onClick={() => setShowFilterDrawer(!showFilterDrawer)}
+                style={{
+                  backgroundColor: showFilterDrawer ? 'var(--bg-hover)' : undefined,
+                  color: hasSecondaryFilter ? 'var(--brand-accent)' : undefined,
+                  fontWeight: hasSecondaryFilter ? 600 : 500,
+                }}
+              >
+                <Filter size={14} />
+                <span>筛选</span>
+              </button>
+            </div>
+          ) : (
+            <div
+              data-testid="formal-search-mode"
+              style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: 'var(--font-size-sm)', color: 'var(--text-primary)', fontWeight: 600 }}
+            >
+              <Search size={15} color="var(--brand-accent)" />
+              <span>正式检索结果</span>
+              <span className="zx-tag neutral">{lastSearchSnapshot?.document_id ? '当前文件范围' : '全部资料范围'}</span>
+            </div>
+          )}
+
+          <span style={{ flex: 1 }} />
+
+          {/* 独立原文与处理详情入口 */}
+          {selectedDoc && (
+            <>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => onOpenDocPreview('preview')}
+                title="查看该文件的原文预览与段落锚点"
+              >
+                <Eye size={14} />
+                <span>查看原文</span>
+              </button>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => onOpenDocPreview('pipeline')}
+                title="查看结构块拆解、任务耗时与技术信息"
+              >
+                <FileText size={14} />
+                <span>处理详情</span>
+              </button>
+              <span className="zx-divider-v" />
+            </>
+          )}
 
           {/* 知识检索输入框 */}
           <div
             style={{
-              width: '280px',
-              height: '32px',
-              border: '1px solid var(--border-color)',
+              flex: '0 1 320px',
+              minWidth: '200px',
+              height: 'var(--control-md)',
+              border: '1px solid var(--border-strong)',
               borderRadius: 'var(--radius-sm)',
               display: 'flex',
               alignItems: 'center',
-              padding: '0 10px',
-              backgroundColor: '#FFFFFF',
-              flexShrink: 0,
+              padding: '0 3px 0 10px',
+              backgroundColor: 'var(--bg-primary)',
+              boxShadow: 'var(--shadow-sm)',
             }}
           >
-            <span title="点击或按回车执行正式检索" style={{ display: 'flex', alignItems: 'center' }}>
-              <Search
-                size={14}
-                color="var(--text-muted)"
-                style={{ marginRight: '6px', cursor: 'pointer' }}
-                onClick={handleExecuteSearch}
-              />
-            </span>
+            <Search size={14} color="var(--text-muted)" style={{ marginRight: '6px', flexShrink: 0 }} />
             <input
               type="text"
-              placeholder="检索已生效知识（回车检索）..."
+              data-testid="formal-search-input"
+              placeholder="输入关键词，回车进入正式检索"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               onKeyDown={(e) => {
@@ -630,53 +692,77 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
               style={{
                 border: 'none',
                 outline: 'none',
-                fontSize: '12px',
+                boxShadow: 'none',
+                fontSize: 'var(--font-size-sm)',
                 width: '100%',
+                minWidth: 0,
                 backgroundColor: 'transparent',
                 color: 'var(--text-primary)',
               }}
             />
             {(searchQuery || activeSearchTerm) && (
-              <span title="清空检索" style={{ display: 'flex', alignItems: 'center', cursor: 'pointer' }} onClick={handleClearSearch}>
-                <X
-                  size={13}
-                  color="var(--text-muted)"
-                />
+              <span
+                data-testid="clear-formal-search"
+                title="清空检索并返回维护浏览"
+                style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', padding: '0 4px' }}
+                onClick={handleClearSearch}
+              >
+                <X size={14} color="var(--text-muted)" />
               </span>
             )}
+            <button
+              type="button"
+              data-testid="formal-search-filter-toggle"
+              onClick={() => setShowSearchFilterDrawer(!showSearchFilterDrawer)}
+              title="设置正式检索条件"
+              style={{
+                color: formalFilterCount > 0 ? 'var(--brand-accent)' : 'var(--text-muted)',
+                display: 'flex',
+                alignItems: 'center',
+                height: '24px',
+                padding: '0 5px',
+                gap: '2px',
+                borderRadius: 'var(--radius-xs)',
+                backgroundColor: showSearchFilterDrawer ? 'var(--bg-hover)' : 'transparent',
+              }}
+            >
+              <Filter size={13} />
+              {formalFilterCount > 0 && <span style={{ fontSize: 'var(--font-size-xs)' }}>{formalFilterCount}</span>}
+            </button>
+            <button
+              type="button"
+              data-testid="formal-search-submit"
+              onClick={handleExecuteSearch}
+              disabled={!searchQuery.trim() || formalSearchStatus === 'loading'}
+              className={searchQuery.trim() ? 'btn-primary btn-sm' : 'btn-ghost btn-sm'}
+              style={{ height: '24px', marginLeft: '2px', opacity: 1 }}
+            >
+              {formalSearchStatus === 'loading' ? '检索中' : '检索'}
+            </button>
           </div>
         </div>
 
+        {/* 第二行：流水线一句结果与动作条 */}
+        {renderPipelineBanner()}
+
         {/* 展开的二级筛选面板 */}
-        {showFilterDrawer && (
+        {showFilterDrawer && !activeSearchTerm && (
           <div
             style={{
               padding: '12px 14px',
-              backgroundColor: 'var(--bg-secondary)',
-              borderRadius: 'var(--radius-sm)',
+              backgroundColor: 'var(--bg-primary)',
+              borderRadius: 'var(--radius-md)',
               border: '1px solid var(--border-color)',
               display: 'flex',
               flexDirection: 'column',
               gap: '10px',
-              fontSize: '12px',
+              fontSize: 'var(--font-size-xs)',
             }}
           >
             {/* 主分类行 */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-              <span style={{ color: 'var(--text-muted)', width: '68px', flexShrink: 0 }}>主分类：</span>
-              <button
-                type="button"
-                onClick={() => setCategoryFilter('all')}
-                style={{
-                  padding: '2px 8px',
-                  borderRadius: 'var(--radius-sm)',
-                  border: '1px solid var(--border-color)',
-                  backgroundColor: categoryFilter === 'all' ? 'var(--brand-accent)' : '#FFFFFF',
-                  color: categoryFilter === 'all' ? '#FFFFFF' : 'var(--text-primary)',
-                  cursor: 'pointer',
-                  fontSize: '12px',
-                }}
-              >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+              <span style={{ color: 'var(--text-muted)', width: '68px', flexShrink: 0 }}>主分类</span>
+              <button type="button" onClick={() => setCategoryFilter('all')} style={filterChipStyle(categoryFilter === 'all')}>
                 全部
               </button>
               {(['制度与标准', '方法与工具', '项目案例', '指标数据', '专家经验'] as PrimaryCategory[]).map((cat) => {
@@ -688,15 +774,7 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                     type="button"
                     data-testid={`tab-${cat}`}
                     onClick={() => setCategoryFilter(isSelected ? 'all' : cat)}
-                    style={{
-                      padding: '2px 8px',
-                      borderRadius: 'var(--radius-sm)',
-                      border: isSelected ? `1px solid ${CATEGORY_STYLES[cat].border}` : '1px solid var(--border-color)',
-                      backgroundColor: isSelected ? CATEGORY_STYLES[cat].bg : '#FFFFFF',
-                      color: isSelected ? CATEGORY_STYLES[cat].text : 'var(--text-secondary)',
-                      cursor: 'pointer',
-                      fontSize: '12px',
-                    }}
+                    style={filterChipStyle(isSelected)}
                   >
                     {cat} ({count})
                   </button>
@@ -705,54 +783,57 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
             </div>
 
             {/* 管理状态行 */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-              <span style={{ color: 'var(--text-muted)', width: '68px', flexShrink: 0 }}>管理状态：</span>
-              <button
-                type="button"
-                onClick={() => setLifecycleFilter('all')}
-                style={{
-                  padding: '2px 8px',
-                  borderRadius: 'var(--radius-sm)',
-                  border: '1px solid var(--border-color)',
-                  backgroundColor: lifecycleFilter === 'all' ? 'var(--brand-accent)' : '#FFFFFF',
-                  color: lifecycleFilter === 'all' ? '#FFFFFF' : 'var(--text-primary)',
-                  cursor: 'pointer',
-                  fontSize: '12px',
-                }}
-              >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+              <span style={{ color: 'var(--text-muted)', width: '68px', flexShrink: 0 }}>管理状态</span>
+              <button type="button" onClick={() => setLifecycleFilter('all')} style={filterChipStyle(lifecycleFilter === 'all')}>
                 全部状态
               </button>
-              <button
-                type="button"
-                onClick={() => setLifecycleFilter('active')}
-                style={{
-                  padding: '2px 8px',
-                  borderRadius: 'var(--radius-sm)',
-                  border: '1px solid var(--border-color)',
-                  backgroundColor: lifecycleFilter === 'active' ? '#ECFDF5' : '#FFFFFF',
-                  color: lifecycleFilter === 'active' ? '#059669' : 'var(--text-secondary)',
-                  cursor: 'pointer',
-                  fontSize: '12px',
-                }}
-              >
+              <button type="button" onClick={() => setLifecycleFilter('active')} style={filterChipStyle(lifecycleFilter === 'active')}>
                 正常服务中 ({stats?.active_count !== undefined ? stats.active_count : stats?.confirmed_count || 0})
               </button>
-              <button
-                type="button"
-                onClick={() => setLifecycleFilter('disabled')}
-                style={{
-                  padding: '2px 8px',
-                  borderRadius: 'var(--radius-sm)',
-                  border: '1px solid var(--border-color)',
-                  backgroundColor: lifecycleFilter === 'disabled' ? '#FEF2F2' : '#FFFFFF',
-                  color: lifecycleFilter === 'disabled' ? '#DC2626' : 'var(--text-secondary)',
-                  cursor: 'pointer',
-                  fontSize: '12px',
-                }}
-              >
+              <button type="button" onClick={() => setLifecycleFilter('disabled')} style={filterChipStyle(lifecycleFilter === 'disabled')}>
                 已停用 ({stats?.disabled_count || 0})
               </button>
             </div>
+          </div>
+        )}
+
+        {showSearchFilterDrawer && (
+          <div
+            data-testid="formal-search-filters"
+            style={{
+              padding: '12px 14px',
+              backgroundColor: 'var(--bg-primary)',
+              borderRadius: 'var(--radius-md)',
+              border: '1px solid var(--border-color)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '10px',
+              fontSize: 'var(--font-size-xs)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span style={{ color: 'var(--text-primary)', fontWeight: 600 }}>
+                正式检索条件
+                <span style={{ color: 'var(--text-muted)', fontWeight: 400, marginLeft: '8px' }}>
+                  同一项多选为“或”，不同项之间为“且”
+                </span>
+              </span>
+              {formalFilterCount > 0 && (
+                <button type="button" className="btn-ghost btn-sm" onClick={clearFormalFilters} style={{ color: 'var(--brand-accent)' }}>
+                  清除检索条件
+                </button>
+              )}
+            </div>
+            {renderFormalFilterRow(
+              '主分类',
+              ['制度与标准', '方法与工具', '项目案例', '指标数据', '专家经验'],
+              formalCategories,
+              setFormalCategories
+            )}
+            {renderFormalFilterRow('客户类型', tagOptions.customer_types, formalCustomerTypes, setFormalCustomerTypes)}
+            {renderFormalFilterRow('业务场景', tagOptions.business_scenes, formalBusinessScenes, setFormalBusinessScenes)}
+            {renderFormalFilterRow('问题', tagOptions.problem_tags, formalProblemTags, setFormalProblemTags)}
           </div>
         )}
       </div>
@@ -762,16 +843,16 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
         style={{
           flex: 1,
           overflowY: 'auto',
-          padding: '20px 24px',
+          padding: '12px 24px 24px',
           display: 'flex',
           flexDirection: 'column',
-          gap: '12px',
+          gap: '10px',
           backgroundColor: 'var(--bg-secondary)',
         }}
       >
         {/* 正式检索模式结果渲染 */}
         {activeSearchTerm ? (
-          isSearching ? (
+          formalSearchStatus === 'loading' ? (
             <div
               style={{
                 padding: '60px 20px',
@@ -780,17 +861,17 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                 fontSize: '13px',
               }}
             >
-              正在检索已建立索引的正式知识...
+              正在检索可用知识...
             </div>
           ) : (
             <>
               {/* 检索结果头部提示 */}
               <div
                 style={{
-                  padding: '10px 16px',
-                  backgroundColor: '#FFFFFF',
+                  padding: '8px 8px 8px 16px',
+                  backgroundColor: 'var(--bg-primary)',
                   border: '1px solid var(--border-color)',
-                  borderRadius: 'var(--radius-sm)',
+                  borderRadius: 'var(--radius-md)',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'space-between',
@@ -798,25 +879,67 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                 }}
               >
                 <div>
-                  检索「<strong style={{ color: 'var(--brand-accent)' }}>{activeSearchTerm}</strong>」：
-                  共找到 <strong>{searchResults.length}</strong> 条正式服务中的可用知识
+                  {formalSearchStatus === 'error' ? (
+                    <>
+                      检索「<strong style={{ color: 'var(--brand-accent)' }}>{activeSearchTerm}</strong>」失败
+                    </>
+                  ) : (
+                    <>
+                      检索「<strong style={{ color: 'var(--brand-accent)' }}>{activeSearchTerm}</strong>」：
+                      共找到 <strong>{searchResults.length}</strong> 条正式服务中的可用知识
+                    </>
+                  )}
                 </div>
                 <button
                   type="button"
-                  className="btn-secondary"
+                  className="btn-ghost btn-sm"
                   onClick={handleClearSearch}
-                  style={{ height: '26px', fontSize: '11px', padding: '0 10px' }}
                 >
                   返回维护列表
                 </button>
               </div>
 
-              {searchResults.length === 0 ? (
+              {formalSearchStatus === 'error' ? (
                 <div
+                  data-testid="formal-search-error"
                   style={{
-                    backgroundColor: '#FFFFFF',
+                    backgroundColor: 'var(--bg-primary)',
                     borderRadius: 'var(--radius-md)',
-                    border: '1px solid var(--border-color)',
+                    boxShadow: 'var(--shadow-md)',
+                    padding: '50px 20px',
+                    textAlign: 'center',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: '10px',
+                  }}
+                >
+                  <AlertCircle size={28} color="var(--danger-text)" />
+                  <div style={{ fontSize: '14px', fontWeight: 600, color: 'var(--text-primary)' }}>
+                    检索暂时不可用，请重试。
+                  </div>
+                  {formalSearchError && formalSearchError !== '检索暂时不可用，请重试。' && (
+                    <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)' }}>
+                      {formalSearchError}
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    data-testid="formal-search-retry"
+                    className="btn-secondary"
+                    onClick={handleRetrySearch}
+                    style={{ height: '30px', fontSize: 'var(--font-size-xs)', marginTop: '4px' }}
+                  >
+                    重试
+                  </button>
+                </div>
+              ) : searchResults.length === 0 ? (
+                <div
+                  data-testid="formal-search-empty"
+                  style={{
+                    backgroundColor: 'var(--bg-primary)',
+                    borderRadius: 'var(--radius-md)',
+                    boxShadow: 'var(--shadow-md)',
                     padding: '50px 20px',
                     textAlign: 'center',
                     display: 'flex',
@@ -827,16 +950,16 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                 >
                   <Search size={28} color="var(--text-muted)" />
                   <div style={{ fontSize: '14px', fontWeight: 600, color: 'var(--text-primary)' }}>
-                    未找到与「{activeSearchTerm}」相关的已生效知识
+                    没有找到符合条件的可用知识，可调整关键词或筛选条件。
                   </div>
-                  <div style={{ fontSize: '12px', color: 'var(--text-muted)', maxWidth: '420px', lineHeight: 1.5 }}>
-                    正式检索仅匹配已确认启用、建立检索索引且未被停用的知识版本。
+                  <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)', maxWidth: '460px', lineHeight: 1.5 }}>
+                    正式检索只展示当前范围内符合启用、有效期、权限与索引资格的知识。
                   </div>
                   <button
                     type="button"
                     className="btn-secondary"
                     onClick={handleClearSearch}
-                    style={{ height: '28px', fontSize: '12px', marginTop: '6px' }}
+                    style={{ height: '28px', fontSize: 'var(--font-size-xs)', marginTop: '6px' }}
                   >
                     返回维护列表
                   </button>
@@ -844,70 +967,39 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
               ) : (
                 searchResults.map((res) => {
                   const catStyle = res.primary_category
-                    ? CATEGORY_STYLES[res.primary_category] || { bg: '#EDF2F7', text: '#4A5568', border: '#CBD5E0' }
-                    : { bg: '#FEF3C7', text: '#B45309', border: '#FCD34D' };
+                    ? CATEGORY_STYLES[res.primary_category] || { bg: 'var(--bg-sunken)', text: 'var(--text-secondary)', border: 'var(--border-strong)' }
+                    : { bg: 'var(--warning-bg)', text: 'var(--warning-text)', border: 'var(--warning-border)' };
 
                   return (
                     <div
-                      key={res.item_id}
-                      onClick={() => setActiveItemId(res.item_id)}
+                      key={res.version_id}
+                      data-testid={`formal-search-result-${res.version_id}`}
+                      onClick={() => setActiveSearchResult(res)}
                       style={{
-                        backgroundColor: '#FFFFFF',
+                        backgroundColor: 'var(--bg-primary)',
                         borderRadius: 'var(--radius-md)',
-                        border: '1px solid var(--border-color)',
+                        boxShadow: 'var(--shadow-md)',
                         padding: '16px 20px',
                         display: 'flex',
                         flexDirection: 'column',
                         gap: '10px',
-                        cursor: 'pointer',
-                        boxShadow: '0 1px 2px rgba(0, 0, 0, 0.03)',
-                        transition: 'border-color 0.15s',
+                        flexShrink: 0,
                       }}
-                      onMouseEnter={(e) => {
-                        e.currentTarget.style.borderColor = 'var(--brand-accent)';
-                      }}
-                      onMouseLeave={(e) => {
-                        e.currentTarget.style.borderColor = 'var(--border-color)';
-                      }}
+                      className="zx-card zx-card-interactive"
                     >
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                          <span
-                            style={{
-                              fontSize: '11px',
-                              fontWeight: 600,
-                              padding: '2px 8px',
-                              borderRadius: 'var(--radius-sm)',
-                              backgroundColor: catStyle.bg,
-                              color: catStyle.text,
-                              border: `1px solid ${catStyle.border}`,
-                            }}
-                          >
+                          <span className="zx-tag" style={{ backgroundColor: catStyle.bg, color: catStyle.text }}>
                             {res.primary_category || '知识'}
                           </span>
                           {res.subject && (
-                            <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                            <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)' }}>
                               适用：{res.subject}
                             </span>
                           )}
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
-                            相关度：{Math.round(res.score * 100)}%
-                          </span>
-                          <span
-                            style={{
-                              fontSize: '11px',
-                              fontWeight: 600,
-                              padding: '2px 8px',
-                              borderRadius: 'var(--radius-sm)',
-                              backgroundColor: '#ECFDF5',
-                              color: '#059669',
-                              border: '1px solid #A7F3D0',
-                            }}
-                          >
-                            服务中 (v{res.version_number})
-                          </span>
+                          <span className="zx-badge success">知识版本 v{res.version_number}</span>
                         </div>
                       </div>
 
@@ -930,20 +1022,58 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                           : res.statement}
                       </div>
 
+                      {res.business_scenes?.length > 0 && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                          <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)' }}>业务场景：</span>
+                          {res.business_scenes.map((scene) => (
+                            <span key={scene} className="zx-tag neutral">
+                              {scene}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
                       <div
                         style={{
                           display: 'flex',
                           alignItems: 'center',
                           justifyContent: 'space-between',
-                          fontSize: '11px',
+                          gap: '12px',
+                          fontSize: 'var(--font-size-xs)',
                           color: 'var(--text-muted)',
                         }}
                       >
-                        <span>来源：{res.document_title}</span>
-                        <span style={{ color: 'var(--brand-accent)', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '2px' }}>
-                          <span>查看与维护</span>
-                          <ArrowRight size={12} />
-                        </span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0, flexWrap: 'wrap' }}>
+                          <span title={res.source.file_name}>来源文件：{res.source.file_name || res.document_title}</span>
+                          <span>文件版本：{formatVersionLabel(res.source.document_version_label)}</span>
+                        </div>
+                        <button
+                          type="button"
+                          data-testid={`formal-source-${res.version_id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenSearchSource(
+                              res.source.document_id,
+                              res.source.document_version_id,
+                              getResultLocator(res)
+                            );
+                          }}
+                          style={{
+                            border: 'none',
+                            background: 'transparent',
+                            color: 'var(--brand-accent)',
+                            fontWeight: 600,
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '3px',
+                            cursor: 'pointer',
+                            fontSize: 'var(--font-size-xs)',
+                            flexShrink: 0,
+                          }}
+                        >
+                          <Eye size={12} />
+                          <span>{describeResultLocator(res)}</span>
+                        </button>
                       </div>
                     </div>
                   );
@@ -954,7 +1084,7 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
         ) : (
           /* 常规维护列表视图 */
           <>
-            {loading ? (
+            {loading && items.length === 0 ? (
               <div
                 style={{
                   padding: '60px 20px',
@@ -965,13 +1095,45 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
               >
                 正在检索知识整理结果...
               </div>
+            ) : listError && items.length === 0 ? (
+              <div
+                data-testid="knowledge-list-error"
+                style={{
+                  backgroundColor: 'var(--bg-primary)',
+                  borderRadius: 'var(--radius-md)',
+                  boxShadow: 'var(--shadow-md)',
+                  padding: '50px 20px',
+                  textAlign: 'center',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  gap: '12px',
+                }}
+              >
+                <AlertCircle size={32} color="var(--danger-text)" />
+                <div style={{ fontSize: '15px', fontWeight: 600, color: 'var(--danger-text)' }}>
+                  知识列表加载失败
+                </div>
+                <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', maxWidth: '420px', lineHeight: 1.5 }}>
+                  {listError}
+                </div>
+                <button
+                  type="button"
+                  data-testid="knowledge-list-retry"
+                  className="btn-secondary"
+                  onClick={handleRetryList}
+                  style={{ height: '30px', fontSize: 'var(--font-size-xs)', marginTop: '6px' }}
+                >
+                  重试
+                </button>
+              </div>
             ) : selectedDoc && ['parsing', 'extracting', 'queued'].includes(selectedDoc.processing_status) ? (
               /* 整理中空状态 */
               <div
                 style={{
-                  backgroundColor: '#FFFFFF',
+                  backgroundColor: 'var(--bg-primary)',
                   borderRadius: 'var(--radius-md)',
-                  border: '1px solid var(--border-color)',
+                  boxShadow: 'var(--shadow-md)',
                   padding: '50px 20px',
                   textAlign: 'center',
                   display: 'flex',
@@ -984,14 +1146,14 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                 <div style={{ fontSize: '15px', fontWeight: 600, color: 'var(--text-primary)' }}>
                   资料正在整理中
                 </div>
-                <div style={{ fontSize: '12px', color: 'var(--text-secondary)', maxWidth: '420px', lineHeight: 1.5 }}>
+                <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', maxWidth: '420px', lineHeight: 1.5 }}>
                   系统正在调用大模型提炼知识原子并校验来源证据，您可以离开此页面处理其他任务，整理完成后将自动呈现。
                 </div>
                 <button
                   type="button"
                   className="btn-secondary"
                   onClick={() => onOpenDocPreview('pipeline')}
-                  style={{ height: '30px', fontSize: '12px', marginTop: '6px' }}
+                  style={{ height: '30px', fontSize: 'var(--font-size-xs)', marginTop: '6px' }}
                 >
                   查看后台处理详情
                 </button>
@@ -1000,9 +1162,9 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
               /* 处理失败空状态 */
               <div
                 style={{
-                  backgroundColor: '#FFFFFF',
+                  backgroundColor: 'var(--bg-primary)',
                   borderRadius: 'var(--radius-md)',
-                  border: '1px solid #FECACA',
+                  boxShadow: 'var(--shadow-md)',
                   padding: '50px 20px',
                   textAlign: 'center',
                   display: 'flex',
@@ -1011,29 +1173,29 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                   gap: '12px',
                 }}
               >
-                <AlertCircle size={32} color="#B91C1C" />
-                <div style={{ fontSize: '15px', fontWeight: 600, color: '#B91C1C' }}>
+                <AlertCircle size={32} color="var(--danger-text)" />
+                <div style={{ fontSize: '15px', fontWeight: 600, color: 'var(--danger-text)' }}>
                   文件已保存，但未能生成知识
                 </div>
-                <div style={{ fontSize: '12px', color: 'var(--text-secondary)', maxWidth: '400px', lineHeight: 1.5 }}>
+                <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-secondary)', maxWidth: '400px', lineHeight: 1.5 }}>
                   正文解析或知识提炼阶段遇到阻碍。请查看失败原因并针对失败步骤发起重试。
                 </div>
                 <button
                   type="button"
                   className="btn-primary"
                   onClick={() => onOpenDocPreview('pipeline')}
-                  style={{ height: '32px', fontSize: '12px', marginTop: '6px' }}
+                  style={{ height: '32px', fontSize: 'var(--font-size-xs)', marginTop: '6px' }}
                 >
                   查看失败原因并重试
                 </button>
               </div>
-            ) : items.length === 0 && (statusFilter !== 'all' || categoryFilter !== 'all' || lifecycleFilter !== 'all' || searchQuery.trim()) ? (
+            ) : items.length === 0 && (statusFilter !== 'all' || categoryFilter !== 'all' || lifecycleFilter !== 'all') ? (
               /* 筛选无结果空状态 */
               <div
                 style={{
-                  backgroundColor: '#FFFFFF',
+                  backgroundColor: 'var(--bg-primary)',
                   borderRadius: 'var(--radius-md)',
-                  border: '1px solid var(--border-color)',
+                  boxShadow: 'var(--shadow-md)',
                   padding: '50px 20px',
                   textAlign: 'center',
                   display: 'flex',
@@ -1046,14 +1208,14 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                 <div style={{ fontSize: '14px', fontWeight: 600, color: 'var(--text-primary)' }}>
                   未找到符合条件的知识条目
                 </div>
-                <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)' }}>
                   可尝试更换搜索词或清除当前分类与状态筛选条件。
                 </div>
                 <button
                   type="button"
                   className="btn-secondary"
                   onClick={handleClearFilters}
-                  style={{ height: '28px', fontSize: '12px', marginTop: '6px' }}
+                  style={{ height: '28px', fontSize: 'var(--font-size-xs)', marginTop: '6px' }}
                 >
                   清除全部筛选
                 </button>
@@ -1062,9 +1224,9 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
               /* 未发现可提取内容空状态 */
               <div
                 style={{
-                  backgroundColor: '#FFFFFF',
+                  backgroundColor: 'var(--bg-primary)',
                   borderRadius: 'var(--radius-md)',
-                  border: '1px solid var(--border-color)',
+                  boxShadow: 'var(--shadow-md)',
                   padding: '50px 20px',
                   textAlign: 'center',
                   display: 'flex',
@@ -1077,7 +1239,7 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                 <div style={{ fontSize: '14px', fontWeight: 600, color: 'var(--text-primary)' }}>
                   未发现可提取的知识条目
                 </div>
-                <div style={{ fontSize: '12px', color: 'var(--text-muted)', maxWidth: '400px', lineHeight: 1.5 }}>
+                <div style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)', maxWidth: '400px', lineHeight: 1.5 }}>
                   该资料可能为纯目录、空表格或扫描件，未包含符合标准的规则或方法。您可以查看原文或更换资料。
                 </div>
                 {selectedDoc && (
@@ -1085,7 +1247,7 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                     type="button"
                     className="btn-secondary"
                     onClick={() => onOpenDocPreview('preview')}
-                    style={{ height: '28px', fontSize: '12px', marginTop: '6px' }}
+                    style={{ height: '28px', fontSize: 'var(--font-size-xs)', marginTop: '6px' }}
                   >
                     查看文件原文
                   </button>
@@ -1093,10 +1255,40 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
               </div>
             ) : (
               /* 正常知识条目列表渲染：卡片优先展示标题、简短摘要、分类和主要业务状态 */
-              items.map((item) => {
+              <>
+                {listError && (
+                  <div
+                    data-testid="knowledge-list-error-banner"
+                    style={{
+                      padding: '10px 16px',
+                      backgroundColor: 'var(--danger-bg)',
+                      border: '1px solid var(--danger-border)',
+                      borderRadius: 'var(--radius-sm)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      fontSize: '13px',
+                      color: 'var(--danger-text)',
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <AlertCircle size={15} />
+                      <span>刷新知识列表失败：{listError}</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={handleRetryList}
+                      style={{ height: '26px', fontSize: 'var(--font-size-xs)', padding: '0 10px' }}
+                    >
+                      重试
+                    </button>
+                  </div>
+                )}
+                {items.map((item) => {
                 const catStyle = item.primary_category
-                  ? CATEGORY_STYLES[item.primary_category] || { bg: '#EDF2F7', text: '#4A5568', border: '#CBD5E0' }
-                  : { bg: '#FEF3C7', text: '#B45309', border: '#FCD34D' };
+                  ? CATEGORY_STYLES[item.primary_category] || { bg: 'var(--bg-sunken)', text: 'var(--text-secondary)', border: 'var(--border-strong)' }
+                  : { bg: 'var(--warning-bg)', text: 'var(--warning-text)', border: 'var(--warning-border)' };
 
                 const isConfirmed = item.review_status === 'confirmed';
                 const isDisabled = item.lifecycle_status === 'disabled';
@@ -1110,145 +1302,53 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                   <div
                     key={item.id}
                     data-testid={`knowledge-item-${item.id}`}
+                    className="zx-card zx-card-interactive"
                     onClick={() => setActiveItemId(item.id)}
                     style={{
-                      backgroundColor: '#FFFFFF',
-                      borderRadius: 'var(--radius-md)',
-                      border: '1px solid var(--border-color)',
-                      padding: '16px 20px',
+                      padding: '16px 20px 14px',
                       display: 'flex',
                       flexDirection: 'column',
-                      gap: '10px',
-                      cursor: 'pointer',
-                      transition: 'border-color 0.15s, box-shadow 0.15s',
-                      boxShadow: '0 1px 2px rgba(0, 0, 0, 0.03)',
-                      opacity: isDisabled ? 0.65 : 1,
-                    }}
-                    onMouseEnter={(e) => {
-                      e.currentTarget.style.borderColor = 'var(--brand-accent)';
-                    }}
-                    onMouseLeave={(e) => {
-                      e.currentTarget.style.borderColor = 'var(--border-color)';
+                      gap: '6px',
+                      opacity: isDisabled ? 0.62 : 1,
+                      flexShrink: 0,
                     }}
                   >
-                    {/* 顶栏：分类标签、业务主体、审核与可用性状态 */}
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        {/* 主分类 */}
-                        <span
-                          style={{
-                            fontSize: '11px',
-                            fontWeight: 600,
-                            padding: '2px 8px',
-                            borderRadius: 'var(--radius-sm)',
-                            backgroundColor: catStyle.bg,
-                            color: catStyle.text,
-                            border: `1px solid ${catStyle.border}`,
-                          }}
-                        >
-                          {item.primary_category || '待分类'}
-                        </span>
-
-                        {/* 业务执行主体 */}
-                        {item.subject && (
-                          <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                            适用：{item.subject}
-                          </span>
-                        )}
+                    {/* 顶栏：知识标题 + 主要业务状态（遵守 PRD 状态边界与可用性要求） */}
+                    <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '12px' }}>
+                      <div style={{ fontSize: 'var(--font-size-md)', fontWeight: 600, color: 'var(--text-primary)', lineHeight: 1.4 }}>
+                        {item.title}
                       </div>
-
-                      {/* 主要业务状态表达（遵守 PRD 状态边界与可用性要求） */}
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0, paddingTop: '2px' }}>
                         {isDisabled ? (
-                          <span
-                            style={{
-                              fontSize: '11px',
-                              fontWeight: 600,
-                              padding: '2px 8px',
-                              borderRadius: 'var(--radius-sm)',
-                              backgroundColor: '#FEF2F2',
-                              color: '#DC2626',
-                              border: '1px solid #FECACA',
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: '3px',
-                            }}
-                          >
-                            <Ban size={12} />
+                          <span className="zx-badge danger">
                             <span>已停用</span>
                           </span>
                         ) : item.has_draft_version ? (
-                          <span
-                            style={{
-                              fontSize: '11px',
-                              fontWeight: 600,
-                              padding: '2px 8px',
-                              borderRadius: 'var(--radius-sm)',
-                              backgroundColor: 'var(--warning-bg)',
-                              color: 'var(--warning-text)',
-                              border: '1px solid #FCD34D',
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: '3px',
-                            }}
-                          >
-                            <Clock size={12} />
+                          <span className="zx-badge warning">
                             <span>待核对新草稿 (v{item.draft_version_number})</span>
                           </span>
                         ) : isConfirmed ? (
-                          <span
-                            style={{
-                              fontSize: '11px',
-                              fontWeight: 600,
-                              padding: '2px 8px',
-                              borderRadius: 'var(--radius-sm)',
-                              backgroundColor: '#ECFDF5',
-                              color: '#059669',
-                              border: '1px solid #A7F3D0',
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: '3px',
-                            }}
-                          >
-                            <CheckCircle2 size={12} />
+                          <span className="zx-badge success">
                             <span>已确认启用</span>
                           </span>
                         ) : (
-                          <span
-                            style={{
-                              fontSize: '11px',
-                              fontWeight: 600,
-                              padding: '2px 8px',
-                              borderRadius: 'var(--radius-sm)',
-                              backgroundColor: 'var(--warning-bg)',
-                              color: 'var(--warning-text)',
-                              border: '1px solid #FCD34D',
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: '3px',
-                            }}
-                          >
-                            <Clock size={12} />
+                          <span className="zx-badge warning">
                             <span>待核对</span>
                           </span>
                         )}
                       </div>
                     </div>
 
-                    {/* 知识标题 */}
-                    <div style={{ fontSize: '15px', fontWeight: 600, color: 'var(--text-primary)', lineHeight: 1.35 }}>
-                      {item.title}
-                    </div>
-
-                    {/* 简短核心陈述摘要 */}
+                    {/* 简短核心陈述摘要（最多两行） */}
                     <div
                       style={{
-                        fontSize: '13px',
+                        fontSize: 'var(--font-size-sm)',
                         color: 'var(--text-secondary)',
-                        lineHeight: 1.55,
-                        backgroundColor: 'var(--bg-secondary)',
-                        padding: '8px 12px',
-                        borderRadius: 'var(--radius-sm)',
+                        lineHeight: 1.6,
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        overflow: 'hidden',
                       }}
                     >
                       {item.statement}
@@ -1258,15 +1358,15 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                     {blockingIssues.length > 0 && (
                       <div
                         style={{
-                          fontSize: '12px',
-                          color: '#B91C1C',
-                          backgroundColor: '#FEF2F2',
-                          border: '1px solid #FECACA',
+                          fontSize: 'var(--font-size-xs)',
+                          color: 'var(--danger-text)',
+                          backgroundColor: 'var(--danger-bg)',
                           padding: '5px 10px',
                           borderRadius: 'var(--radius-sm)',
                           display: 'flex',
                           alignItems: 'center',
                           gap: '6px',
+                          marginTop: '2px',
                         }}
                       >
                         <AlertCircle size={13} style={{ flexShrink: 0 }} />
@@ -1274,87 +1374,70 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
                       </div>
                     )}
 
-                    {/* 底栏 */}
+                    {/* 底栏：分类 · 适用对象 · 来源 · 场景 | 操作 */}
                     <div
                       style={{
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'space-between',
-                        fontSize: '11px',
+                        gap: '12px',
+                        fontSize: 'var(--font-size-xs)',
                         color: 'var(--text-muted)',
-                        marginTop: '2px',
+                        marginTop: '6px',
+                        minHeight: '28px',
                       }}
                     >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0, flexWrap: 'wrap' }}>
+                        <span className="zx-tag" style={{ backgroundColor: catStyle.bg, color: catStyle.text }}>
+                          {item.primary_category || '待分类'}
+                        </span>
+
+                        {item.subject && <span style={{ color: 'var(--text-secondary)' }}>适用：{item.subject}</span>}
+
                         {!selectedDoc && (
-                          <span style={{ display: 'flex', alignItems: 'center', gap: '4px', color: 'var(--text-secondary)' }}>
+                          <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                             <FileText size={12} />
                             <span>来源：{item.document_title}</span>
                           </span>
                         )}
 
-                        {item.business_scenes && item.business_scenes.slice(0, 2).map((s) => (
-                          <span
-                            key={s}
-                            style={{
-                              backgroundColor: 'var(--bg-secondary)',
-                              padding: '1px 6px',
-                              borderRadius: '10px',
-                              border: '1px solid var(--border-color)',
-                            }}
-                          >
-                            {s}
-                          </span>
-                        ))}
+                        {item.business_scenes &&
+                          item.business_scenes.slice(0, 2).map((s) => (
+                            <span key={s} style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                              <span style={{ color: 'var(--border-strong)' }}>·</span>
+                              <span>{s}</span>
+                            </span>
+                          ))}
                       </div>
 
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <div className="zx-card-hover-actions" style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
                         {/* 快捷停用/恢复按钮 */}
                         {isConfirmed && !isDisabled && (
-                          <button
-                            type="button"
-                            onClick={(e) => handleToggleItemLifecycle(e, item)}
-                            style={{
-                              background: 'none',
-                              border: '1px solid var(--border-color)',
-                              borderRadius: 'var(--radius-xs)',
-                              padding: '2px 8px',
-                              fontSize: '11px',
-                              color: 'var(--text-secondary)',
-                              cursor: 'pointer',
-                            }}
-                          >
+                          <button type="button" className="btn-ghost btn-sm" onClick={(e) => handleToggleItemLifecycle(e, item)}>
                             停用
                           </button>
                         )}
                         {isDisabled && (
                           <button
                             type="button"
+                            className="btn-ghost btn-sm"
                             onClick={(e) => handleToggleItemLifecycle(e, item)}
-                            style={{
-                              background: 'none',
-                              border: '1px solid #A7F3D0',
-                              backgroundColor: '#ECFDF5',
-                              borderRadius: 'var(--radius-xs)',
-                              padding: '2px 8px',
-                              fontSize: '11px',
-                              color: '#059669',
-                              cursor: 'pointer',
-                            }}
+                            style={{ color: 'var(--brand-accent)' }}
                           >
                             恢复启用
                           </button>
                         )}
 
-                        <span style={{ color: 'var(--brand-accent)', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '2px' }}>
+                        <span className="btn-secondary btn-sm">
                           <span>{isConfirmed ? '查看/维护' : '核对知识'}</span>
-                          <ArrowRight size={12} />
+                          <ArrowRight size={13} />
                         </span>
                       </div>
                     </div>
                   </div>
                 );
-              })
+              })}
+              </>
             )}
           </>
         )}
@@ -1364,10 +1447,38 @@ export const KnowledgeListPane: React.FC<KnowledgeListPaneProps> = ({
       <ProofreadingModal
         itemId={activeItemId}
         itemList={items.map((i) => i.id)}
+        items={items}
         onSelectNext={(nextId) => setActiveItemId(nextId)}
         onClose={() => setActiveItemId(null)}
-        onSaved={fetchKnowledgeData}
-        onDeleted={fetchKnowledgeData}
+        onSaved={() => fetchKnowledgeData(true)}
+        onDeleted={() => fetchKnowledgeData(true)}
+      />
+
+      <SearchResultDetailModal
+        result={activeSearchResult}
+        onClose={() => setActiveSearchResult(null)}
+        onOpenSource={(documentId, versionId, locator) => {
+          setActiveSearchResult(null);
+          onOpenSearchSource(documentId, versionId, locator);
+        }}
+      />
+
+      <AppConfirmDialog
+        isOpen={lifecycleConfirmState.isOpen}
+        title={lifecycleConfirmState.targetStatus === 'disabled' ? '停用知识条目？' : '恢复启用知识条目？'}
+        variant={lifecycleConfirmState.targetStatus === 'disabled' ? 'danger' : 'primary'}
+        targetName={lifecycleConfirmState.item?.title}
+        confirmText={lifecycleConfirmState.targetStatus === 'disabled' ? '停用知识' : '恢复启用'}
+        cancelText="取消"
+        initialFocus={lifecycleConfirmState.targetStatus === 'disabled' ? 'cancel' : 'confirm'}
+        loading={lifecycleConfirmState.loading}
+        impactDescription={
+          lifecycleConfirmState.targetStatus === 'disabled'
+            ? '停用后该条目将退出正式检索，不再对外提供服务。历史版本与证据完整保留，可随时恢复启用。'
+            : '恢复后该条目将重新符合正式检索条件，即刻向检索服务生效。'
+        }
+        onConfirm={handleConfirmLifecycleToggle}
+        onCancel={handleCancelLifecycleToggle}
       />
     </div>
   );

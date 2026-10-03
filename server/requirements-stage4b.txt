@@ -1,0 +1,2 @@
+# Stage 4B real Chinese embedding runtime
+sentence-transformers==3.4.1

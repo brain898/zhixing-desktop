@@ -163,7 +163,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
       style={{
         position: 'fixed',
         inset: 0,
-        backgroundColor: 'rgba(0, 0, 0, 0.45)',
+        backgroundColor: 'rgba(18, 26, 22, 0.42)',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
@@ -177,7 +177,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
           maxHeight: '80vh',
           backgroundColor: '#FFFFFF',
           borderRadius: 'var(--radius-lg)',
-          boxShadow: '0 8px 30px rgba(0, 0, 0, 0.15)',
+          boxShadow: 'var(--shadow-lg)',
           display: 'flex',
           flexDirection: 'column',
           overflow: 'hidden',
@@ -193,7 +193,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
             justifyContent: 'space-between',
           }}
         >
-          <div style={{ fontSize: 'var(--font-size-base)', fontWeight: 600, color: 'var(--text-primary)' }}>
+          <div style={{ fontSize: 'var(--font-size-section)', fontWeight: 600, color: 'var(--text-primary)' }}>
             导入物业资料
           </div>
           <button
@@ -275,29 +275,29 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
                       >
                         {item.file.name}
                       </span>
-                      <span style={{ fontSize: '11px', color: 'var(--text-muted)', flexShrink: 0 }}>
+                      <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--text-muted)', flexShrink: 0 }}>
                         ({(item.file.size / 1024).toFixed(0)} KB)
                       </span>
                     </div>
 
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
                       {item.status === 'uploading' && (
-                        <span style={{ fontSize: '11px', color: 'var(--pending-text)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--pending-text)', display: 'flex', alignItems: 'center', gap: '4px' }}>
                           <RotateCw size={12} className="spin-slow" /> 上传中
                         </span>
                       )}
                       {item.status === 'success' && (
-                        <span style={{ fontSize: '11px', color: 'var(--success-text)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--success-text)', display: 'flex', alignItems: 'center', gap: '4px' }}>
                           <CheckCircle2 size={12} /> 成功
                         </span>
                       )}
                       {item.status === 'failed' && (
-                        <span style={{ fontSize: '11px', color: 'var(--error-text)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--error-text)', display: 'flex', alignItems: 'center', gap: '4px' }}>
                           <AlertCircle size={12} /> 失败
                         </span>
                       )}
                       {item.status === 'conflict' && (
-                        <span style={{ fontSize: '11px', color: 'var(--pending-text)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--pending-text)', display: 'flex', alignItems: 'center', gap: '4px' }}>
                           <AlertCircle size={12} /> 同名冲突
                         </span>
                       )}
@@ -318,7 +318,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
                   {item.message && (
                     <div
                       style={{
-                        fontSize: '11px',
+                        fontSize: 'var(--font-size-xs)',
                         color: item.status === 'failed' ? 'var(--error-text)' : 'var(--text-secondary)',
                       }}
                     >
@@ -333,7 +333,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
                         type="button"
                         onClick={() => handleResolveConflict(idx, 'new_version')}
                         className="btn-secondary"
-                        style={{ fontSize: '11px', height: '24px', padding: '0 8px' }}
+                        style={{ fontSize: 'var(--font-size-xs)', height: '24px', padding: '0 8px' }}
                       >
                         作为已有文件的新版本
                       </button>
@@ -341,7 +341,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
                         type="button"
                         onClick={() => handleResolveConflict(idx, 'new_document')}
                         className="btn-secondary"
-                        style={{ fontSize: '11px', height: '24px', padding: '0 8px' }}
+                        style={{ fontSize: 'var(--font-size-xs)', height: '24px', padding: '0 8px' }}
                       >
                         作为独立文件保存
                       </button>
@@ -381,7 +381,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpl
             disabled={uploading || fileList.filter((f) => f.status === 'pending').length === 0}
             style={{ height: '34px', fontSize: '13px' }}
           >
-            {uploading ? '正在批量处理...' : `开始导入 (${fileList.filter((f) => f.status === 'pending').length})`}
+            {uploading ? '正在批量处理...' : '开始导入'}
           </button>
         </div>
       </div>
